@@ -21,6 +21,25 @@ mod tls;
 
 use session_hooks::{session_hooks_from_config, SessionHooks};
 
+/// Cap on a single fastpath update, in bytes.
+///
+/// IronRDP splits an update into tiles of at most `max_request_size` *payload*
+/// bytes, then wraps each tile in a PDU header. The header is not accounted for,
+/// so a tile sized exactly to the limit goes over it on the wire and the client
+/// drops the connection:
+///
+/// ```text
+/// 4096 * 512 * 4 = 8388608  (= the 8 MiB default, exactly)
+///              + 22 bytes of header
+///                = 8388630  -> "Total size (8388630) exceeds MultifragMaxRequestSize (8388608)"
+/// ```
+///
+/// It bites whenever the width divides the limit evenly, so a 4096-wide session
+/// hits it on the first full-screen update regardless of bitrate or codec.
+/// Reserve a whole 4 KiB rather than the 22 bytes actually needed, so the
+/// headroom survives header changes and other widths.
+const MAX_REQUEST_SIZE: u32 = 8 * 1024 * 1024 - 4096;
+
 pub struct ServerContext {
     server: RdpServer,
     pub display_handle: HyprDisplayHandle,
@@ -117,6 +136,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_preempt_existing_session(security_mode.allows_authenticated_replacement())
+        .with_max_request_size(MAX_REQUEST_SIZE)
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
             input_session_sink,
             session_hooks,
