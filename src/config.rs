@@ -94,8 +94,13 @@ struct Args {
     username: Option<String>,
 
     /// Password for RDP authentication
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "password_file")]
     password: Option<String>,
+
+    /// Read the RDP password from a file (one trailing line ending is
+    /// stripped; the rest of the content is used as-is)
+    #[arg(long, conflicts_with = "password")]
+    password_file: Option<String>,
 
     /// RDP session resolution (WxH), e.g. 1920x1080
     #[arg(short, long)]
@@ -184,6 +189,7 @@ struct ConfigFile {
     key: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    password_file: Option<String>,
     resolution: Option<String>,
     scale: Option<f64>,
     capture_mode: Option<String>,
@@ -335,7 +341,12 @@ impl RuntimeConfig {
         let cert = args.cert.or(config.cert);
         let key = args.key.or(config.key);
         let username = args.username.or(config.username).unwrap_or_default();
-        let password = args.password.or(config.password).unwrap_or_default();
+        let password = resolve_password(
+            args.password,
+            args.password_file,
+            config.password,
+            config.password_file,
+        )?;
         let credentials = ConfigCredentials::from_parts(username, password);
         let (file_transfer_mode, file_transfer_warning) =
             resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
@@ -470,6 +481,53 @@ fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
             "unknown file transfer mode '{other}', expected 'off', 'to-client', 'to-server', or 'both'"
         ),
     }
+}
+
+fn resolve_password(
+    args_password: Option<String>,
+    args_password_file: Option<String>,
+    config_password: Option<String>,
+    config_password_file: Option<String>,
+) -> anyhow::Result<String> {
+    if config_password.is_some() && config_password_file.is_some() {
+        anyhow::bail!("`password` and `password_file` cannot both be set in the config file");
+    }
+
+    if let Some(path) = args_password_file {
+        return read_password_file(&path);
+    }
+    if let Some(password) = args_password {
+        return Ok(password);
+    }
+
+    match (config_password, config_password_file) {
+        (Some(password), None) => Ok(password),
+        (None, Some(path)) => read_password_file(&path),
+        (None, None) => Ok(String::new()),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    }
+}
+
+/// Reads a password from `path`, stripping exactly one trailing line ending
+/// (`\n` or `\r\n`). Fails if the file cannot be read, or is empty once that
+/// trailing line ending is removed.
+fn read_password_file(path: &str) -> anyhow::Result<String> {
+    let mut content = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("failed to read password file {}: {}", path, error))?;
+
+    if content.last() == Some(&b'\n') {
+        content.pop();
+        if content.last() == Some(&b'\r') {
+            content.pop();
+        }
+    }
+
+    if content.is_empty() {
+        anyhow::bail!("password file {} is empty", path);
+    }
+
+    String::from_utf8(content)
+        .map_err(|_| anyhow::anyhow!("password file {} is not valid UTF-8", path))
 }
 
 fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
@@ -1027,6 +1085,158 @@ mod tests {
         let args = Args::try_parse_from(["hypr-rdp", "--h264-backend", "software"]).unwrap();
 
         assert_eq!(args.h264_backend.as_deref(), Some("software"));
+    }
+
+    #[test]
+    fn cli_rejects_password_and_password_file_together() {
+        let error = Args::try_parse_from(["hypr-rdp", "--password", "x", "--password-file", "f"])
+            .expect_err("--password and --password-file must conflict");
+
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn config_rejects_password_and_password_file_together() {
+        let error = resolve_password(
+            None,
+            None,
+            Some("secret".into()),
+            Some("/does/not/matter".into()),
+        )
+        .expect_err("password and password_file must conflict in the config file");
+
+        assert!(format!("{error:#}").contains("cannot both be set"));
+    }
+
+    #[test]
+    fn cli_password_file_overrides_config_password() {
+        let path = write_password_file("cli-overrides-config-password", "cli-secret\n");
+
+        let password = resolve_password(
+            None,
+            Some(path.to_str().unwrap().to_owned()),
+            Some("config-secret".into()),
+            None,
+        )
+        .expect("password loads from file");
+
+        assert_eq!(password, "cli-secret");
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn cli_password_overrides_config_password_file() {
+        let path = write_password_file("cli-overrides-config-password-file", "config-secret\n");
+
+        let password = resolve_password(
+            Some("cli-secret".into()),
+            None,
+            None,
+            Some(path.to_str().unwrap().to_owned()),
+        )
+        .expect("password comes from the CLI literal");
+
+        assert_eq!(password, "cli-secret");
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn config_password_file_loads_successfully() {
+        let path = write_password_file("config-password-file-loads", "config-secret\n");
+
+        let password = resolve_password(None, None, None, Some(path.to_str().unwrap().to_owned()))
+            .expect("password loads from config-specified file");
+
+        assert_eq!(password, "config-secret");
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn no_password_source_yields_empty_password() {
+        let password = resolve_password(None, None, None, None).expect("no sources is fine");
+        assert_eq!(password, "");
+    }
+
+    #[test]
+    fn password_file_missing_fails_startup() {
+        let path = temp_config_path("password-file-missing");
+        let _ = fs::remove_file(&path);
+
+        let error = read_password_file(path.to_str().unwrap())
+            .expect_err("a missing password file must fail startup");
+
+        assert!(format!("{error:#}").contains("failed to read password file"));
+    }
+
+    #[test]
+    fn password_file_empty_fails_startup() {
+        let path = write_password_file("password-file-empty", "");
+
+        let error = read_password_file(path.to_str().unwrap())
+            .expect_err("an empty password file must fail startup");
+
+        assert!(format!("{error:#}").contains("is empty"));
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn password_file_empty_after_stripping_line_ending_fails_startup() {
+        let path = write_password_file("password-file-only-newline", "\n");
+
+        let error = read_password_file(path.to_str().unwrap())
+            .expect_err("a file containing only a line ending must fail startup");
+
+        assert!(format!("{error:#}").contains("is empty"));
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn password_file_strips_exactly_one_trailing_line_ending() {
+        for (content, expected) in [
+            ("secret\n", "secret"),
+            ("secret\r\n", "secret"),
+            ("secret", "secret"),
+            ("secret\n\n", "secret\n"),
+            (" secret with spaces \n", " secret with spaces "),
+        ] {
+            let path = write_password_file("password-file-strip", content);
+
+            let password = read_password_file(path.to_str().unwrap()).expect("password file loads");
+
+            assert_eq!(password, expected, "content: {content:?}");
+            fs::remove_file(&path).expect("remove password file");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_file_unreadable_fails_startup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = write_password_file("password-file-unreadable", "secret\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("remove read permission");
+
+        // Skip if running as a user that bypasses permission bits (e.g. root).
+        if fs::read(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok();
+            fs::remove_file(&path).ok();
+            return;
+        }
+
+        let error = read_password_file(path.to_str().unwrap())
+            .expect_err("an unreadable password file must fail startup");
+
+        assert!(format!("{error:#}").contains("failed to read password file"));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok();
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    fn write_password_file(name: &str, content: &str) -> PathBuf {
+        let path = temp_config_path(name);
+        fs::write(&path, content).expect("write password file");
+        path
     }
 
     #[test]
