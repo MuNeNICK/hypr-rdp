@@ -513,7 +513,7 @@ fn resolve_password(
 /// trailing line ending is removed.
 fn read_password_file(path: &str) -> anyhow::Result<String> {
     let mut content = std::fs::read(path)
-        .map_err(|error| anyhow::anyhow!("failed to read password file {}: {}", path, error))?;
+        .map_err(|error| anyhow::anyhow!("failed to read password file {path:?}: {error}"))?;
 
     if content.last() == Some(&b'\n') {
         content.pop();
@@ -523,11 +523,11 @@ fn read_password_file(path: &str) -> anyhow::Result<String> {
     }
 
     if content.is_empty() {
-        anyhow::bail!("password file {} is empty", path);
+        anyhow::bail!("password file {path:?} is empty");
     }
 
     String::from_utf8(content)
-        .map_err(|_| anyhow::anyhow!("password file {} is not valid UTF-8", path))
+        .map_err(|_| anyhow::anyhow!("password file {path:?} is not valid UTF-8"))
 }
 
 fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
@@ -1092,7 +1092,7 @@ mod tests {
         let error = Args::try_parse_from(["hypr-rdp", "--password", "x", "--password-file", "f"])
             .expect_err("--password and --password-file must conflict");
 
-        assert!(error.to_string().contains("cannot be used with"));
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -1187,6 +1187,18 @@ mod tests {
             .expect_err("a file containing only a line ending must fail startup");
 
         assert!(format!("{error:#}").contains("is empty"));
+        fs::remove_file(&path).expect("remove password file");
+    }
+
+    #[test]
+    fn password_file_invalid_utf8_fails_startup() {
+        let path = temp_config_path("password-file-invalid-utf8");
+        fs::write(&path, [0xff]).expect("write password file");
+
+        let error = read_password_file(path.to_str().unwrap())
+            .expect_err("an invalid UTF-8 password file must fail startup");
+
+        assert!(format!("{error:#}").contains("is not valid UTF-8"));
         fs::remove_file(&path).expect("remove password file");
     }
 

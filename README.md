@@ -141,9 +141,10 @@ startup, with exactly one trailing line ending (`\n` or `\r\n`) removed; if it
 is missing, unreadable, or empty after that, hypr-rdp fails to start rather
 than falling back to unauthenticated operation.
 
-Setting only `-u`/`username` or only `-p`/`--password`/`password_file` (not
-both) is accepted: the missing half is treated as empty, hypr-rdp logs a
-warning, and the client must match that empty value to authenticate.
+Setting only `-u`/`--username`/`username` or only
+`-p`/`--password`/`--password-file`/`password`/`password_file` (not both) is
+accepted: the missing half is treated as empty, hypr-rdp logs a warning, and
+the client must match that empty value to authenticate.
 
 ### Session hooks
 
