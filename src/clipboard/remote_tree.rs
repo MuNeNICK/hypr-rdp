@@ -39,12 +39,54 @@ pub(super) struct RemoteNode {
     pub(super) size: u64,
     pub(super) modified: SystemTime,
     pub(super) kind: RemoteNodeKind,
+    /// Whether the client marked this entry read-only. Only that marking makes
+    /// it read-only here; the mount being read-only does not.
+    read_only: bool,
     children: Vec<u64>,
 }
 
 impl RemoteNode {
     pub(super) fn is_directory(&self) -> bool {
         matches!(self.kind, RemoteNodeKind::Directory)
+    }
+
+    /// The permission bits the mount reports for this entry, matching what a
+    /// GNOME session reports for the same descriptor.
+    ///
+    /// A file manager pasting out of the mount copies the source mode, so a
+    /// mount that reported its own read-only-ness per file would land every
+    /// pasted file unwritable by the user who pasted it. The client's
+    /// read-only attribute is the only thing that makes an entry read-only;
+    /// the kernel enforces the mount's read-only-ness on its own.
+    pub(super) fn permissions(&self) -> u16 {
+        match (self.is_directory(), self.read_only) {
+            (true, false) => 0o755,
+            (true, true) => 0o555,
+            (false, false) => 0o644,
+            (false, true) => 0o444,
+        }
+    }
+}
+
+/// What one client descriptor says about the entry it names, or what a
+/// synthesized parent directory carries in the absence of a descriptor.
+#[derive(Clone, Copy)]
+struct RemoteEntry {
+    kind: RemoteNodeKind,
+    size: u64,
+    modified: Option<SystemTime>,
+    read_only: bool,
+}
+
+impl RemoteEntry {
+    /// A directory the client named only as some entry's parent.
+    fn synthesized_directory() -> Self {
+        Self {
+            kind: RemoteNodeKind::Directory,
+            size: 0,
+            modified: None,
+            read_only: false,
+        }
     }
 }
 
@@ -80,6 +122,8 @@ impl RemoteTree {
                 size: 0,
                 modified: built_at,
                 kind: RemoteNodeKind::Directory,
+                // The mount point itself is nobody's to write.
+                read_only: true,
                 children: Vec::new(),
             }],
             by_name: HashMap::new(),
@@ -130,16 +174,17 @@ impl RemoteTree {
                 continue;
             }
 
-            let kind = if is_directory(file) {
-                RemoteNodeKind::Directory
-            } else {
-                RemoteNodeKind::File { index }
+            let entry = RemoteEntry {
+                kind: if is_directory(file) {
+                    RemoteNodeKind::Directory
+                } else {
+                    RemoteNodeKind::File { index }
+                },
+                size: file_size(file),
+                modified: file.last_write_time.and_then(system_time),
+                read_only: is_read_only(file),
             };
-            let modified = file.last_write_time.and_then(system_time);
-            if tree
-                .insert(parent, leaf, kind, file_size(file), modified, max_entries)
-                .is_none()
-            {
+            if tree.insert(parent, leaf, entry, max_entries).is_none() {
                 dropped += 1;
             }
         }
@@ -231,9 +276,7 @@ impl RemoteTree {
             None => self.insert(
                 parent,
                 name,
-                RemoteNodeKind::Directory,
-                0,
-                None,
+                RemoteEntry::synthesized_directory(),
                 max_entries,
             ),
         }
@@ -246,20 +289,21 @@ impl RemoteTree {
         &mut self,
         parent: u64,
         name: &str,
-        kind: RemoteNodeKind,
-        size: u64,
-        modified: Option<SystemTime>,
+        entry: RemoteEntry,
         max_entries: usize,
     ) -> Option<u64> {
         if let Some(inode) = self.lookup(parent, name) {
-            if !self.node(inode)?.is_directory() || kind != RemoteNodeKind::Directory {
+            if !self.node(inode)?.is_directory() || entry.kind != RemoteNodeKind::Directory {
                 return None;
             }
             // A directory synthesized for a child that arrived first carries no
             // metadata of its own until the client describes it.
-            if let Some(modified) = modified {
-                let offset = usize::try_from(inode.checked_sub(self.base)?).ok()? + 1;
+            let offset = usize::try_from(inode.checked_sub(self.base)?).ok()? + 1;
+            if let Some(modified) = entry.modified {
                 self.nodes.get_mut(offset)?.modified = modified;
+            }
+            if entry.read_only {
+                self.nodes.get_mut(offset)?.read_only = true;
             }
             return Some(inode);
         }
@@ -271,9 +315,10 @@ impl RemoteTree {
         self.nodes.push(RemoteNode {
             name: name.to_owned(),
             parent,
-            size,
-            modified: modified.unwrap_or(self.built_at),
-            kind,
+            size: entry.size,
+            modified: entry.modified.unwrap_or(self.built_at),
+            kind: entry.kind,
+            read_only: entry.read_only,
             children: Vec::new(),
         });
         self.by_name.insert((parent, name.to_owned()), inode);
@@ -316,6 +361,11 @@ fn path_components(file: &FileDescriptor) -> Option<Vec<&str>> {
 fn is_directory(file: &FileDescriptor) -> bool {
     file.attributes
         .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::DIRECTORY))
+}
+
+fn is_read_only(file: &FileDescriptor) -> bool {
+    file.attributes
+        .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::READONLY))
 }
 
 fn file_size(file: &FileDescriptor) -> u64 {
@@ -525,5 +575,82 @@ mod tests {
         assert!(second.node(held).is_none());
         assert_eq!(second.roots().len(), 1);
         assert_ne!(second.resolve("other.txt"), Some(held));
+    }
+
+    /// A pasted file is copied with the mode the mount reports, so reporting
+    /// the mount's own read-only-ness per file would leave every pasted file
+    /// unwritable by the user who pasted it.
+    #[test]
+    fn an_ordinary_entry_arrives_writable_by_its_owner() {
+        let tree = build(
+            &[
+                directory("project", None),
+                file("main.rs", Some("project"), 4),
+            ],
+            100,
+        );
+
+        let (_, project) = at(&tree, "project").expect("directory exists");
+        let (_, main) = at(&tree, "project/main.rs").expect("file exists");
+
+        assert_eq!(project.permissions(), 0o755);
+        assert_eq!(main.permissions(), 0o644);
+    }
+
+    #[test]
+    fn only_an_entry_the_client_marked_read_only_arrives_read_only() {
+        let read_only = |descriptor: FileDescriptor, attributes| {
+            descriptor.with_attributes(attributes | ClipboardFileAttributes::READONLY)
+        };
+        let tree = build(
+            &[
+                read_only(
+                    directory("locked", None),
+                    ClipboardFileAttributes::DIRECTORY,
+                ),
+                read_only(
+                    file("notes.txt", Some("locked"), 4),
+                    ClipboardFileAttributes::NORMAL,
+                ),
+            ],
+            100,
+        );
+
+        let (_, locked) = at(&tree, "locked").expect("directory exists");
+        let (_, notes) = at(&tree, "locked/notes.txt").expect("file exists");
+
+        assert_eq!(locked.permissions(), 0o555);
+        assert_eq!(notes.permissions(), 0o444);
+    }
+
+    /// A directory the client named only as a parent carries no attributes of
+    /// its own, and picks them up when the client finally describes it.
+    #[test]
+    fn a_synthesized_directory_is_writable_until_the_client_marks_it_read_only() {
+        let tree = build(&[file("deep.txt", Some("outer"), 1)], 100);
+        let (_, synthesized) = at(&tree, "outer").expect("directory exists");
+        assert_eq!(synthesized.permissions(), 0o755);
+
+        let tree = build(
+            &[
+                file("deep.txt", Some("outer"), 1),
+                directory("outer", None).with_attributes(
+                    ClipboardFileAttributes::DIRECTORY | ClipboardFileAttributes::READONLY,
+                ),
+            ],
+            100,
+        );
+        let (_, described) = at(&tree, "outer").expect("directory exists");
+        assert_eq!(described.permissions(), 0o555);
+    }
+
+    #[test]
+    fn the_mount_point_itself_is_never_writable() {
+        let tree = build(&[file("one.txt", None, 1)], 100);
+
+        assert_eq!(
+            tree.node(ROOT_INODE).expect("root exists").permissions(),
+            0o555
+        );
     }
 }

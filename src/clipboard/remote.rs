@@ -420,7 +420,6 @@ fn file_type(node: &RemoteNode) -> fuser::FileType {
 
 #[cfg(feature = "client-to-server")]
 fn node_attr(tree: &RemoteTree, inode: u64, node: &RemoteNode) -> fuser::FileAttr {
-    let directory = node.is_directory();
     fuser::FileAttr {
         ino: fuser::INodeNo(inode),
         size: node.size,
@@ -430,7 +429,7 @@ fn node_attr(tree: &RemoteTree, inode: u64, node: &RemoteNode) -> fuser::FileAtt
         ctime: node.modified,
         crtime: node.modified,
         kind: file_type(node),
-        perm: if directory { 0o500 } else { 0o400 },
+        perm: node.permissions(),
         nlink: tree.link_count(inode),
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },

@@ -20,6 +20,11 @@
 - Fixed directory symlink aliases being mistaken for ancestor cycles and omitted from transfers.
 - Fixed pending client-file reads not being cancelled when the desktop clipboard owner changes.
 - Fixed only the first file copy on the client reaching the desktop in a session. The request state that dedupes repeated announcements of one clipboard selection was cleared when an ordinary format answer arrived but not when a file list did, so every later file copy was dropped as a repeat and the mount kept serving the first selection.
+- Fixed files pasted from the client arriving read-only. The mount reported every file as
+  mode 0400 and every directory as 0500, and a file manager copies the source mode, so a
+  pasted file landed unwritable by the user who pasted it. Files now arrive 0644 and
+  directories 0755, as they do in a GNOME session; only an entry the client itself marked
+  read-only arrives read-only. The mount stays read-only.
 
 ## [0.1.5] - 2026-08-19
 
