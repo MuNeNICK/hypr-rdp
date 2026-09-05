@@ -9,6 +9,9 @@ license=('MIT')
 options=(!debug)
 depends=(
     'ffmpeg'
+    # fusermount3, the setuid helper the clipboard mounts the client's files
+    # through. Runtime only: the FUSE binding is pure Rust and links nothing.
+    'fuse3'
     'libpulse'
     'libva'
     'libxkbcommon'

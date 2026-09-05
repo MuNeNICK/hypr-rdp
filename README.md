@@ -9,7 +9,8 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync
 - **File transfer** — Copy files and folders in a Hyprland file manager and paste them into
-  the client's, over the clipboard channel. See "File transfer"
+  the client's, and paste the client's files back onto the desktop, over the clipboard
+  channel. See "File transfer"
 - **Input** — Full keyboard and mouse support via virtual keyboard/pointer protocols
 - **Session hooks** — Run a command when a client session starts and ends
 - **TLS** — Auto-generated self-signed RSA-2048 certificates, or bring your own. Existing
@@ -52,7 +53,8 @@ sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 
 Runtime dependencies: `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon`,
 and `pactl` through PipeWire's PulseAudio compatibility layer for the default
-remote-audio routing mode.
+remote-audio routing mode. Pasting files from the client also needs `fusermount3`
+(Arch: `fuse3`); without it that one direction warns and is skipped.
 
 For VA-API hardware encoding, install a VA-API driver such as
 `intel-media-driver` for Intel GPUs or `libva-mesa-driver` for AMD GPUs.
@@ -62,6 +64,9 @@ For VA-API hardware encoding, install a VA-API driver such as
 Requirements:
 - Rust 1.75+
 - `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon` (development headers)
+
+Pasting files from the client is the default-on `client-to-server` feature and needs FUSE
+at runtime, not at build time. See "Pasting from the client".
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
@@ -216,6 +221,37 @@ leave the machine in that case even though contents do not.
 Paths are only ever taken from a selection the desktop user themselves put on the
 clipboard — never from anything the client sends — and a file swapped out between the copy
 and the paste is detected and refused rather than served under the old name.
+
+#### Pasting from the client
+
+Files copied on the client paste onto the Hyprland desktop through a read-only FUSE mount
+of the client's selection, so the paste completes at once and the bytes stream as the file
+is read rather than downloading first.
+
+This direction is the `client-to-server` build feature, **enabled by default**. It is
+optional because it needs FUSE at runtime, which not every machine offers:
+
+- The `fusermount3` setuid helper — on Arch, the `fuse3` package, which the AUR recipes
+  depend on.
+- On NixOS, that helper is a setuid wrapper at `/run/wrappers/bin/fusermount3`, built only
+  when **`programs.fuse.enable = true;`** is set. That option is on by default on NixOS
+  25.11 but off on `nixos-unstable`, so an upgrade can take the helper away. Set
+  `FUSERMOUNT_PATH` to point at the helper anywhere else it lives.
+- Nothing in `/etc/fuse.conf` needs changing, and `allow_other` is never used: the mount is
+  private to the user running hypr-rdp, under a mode-0700 directory in `XDG_RUNTIME_DIR`.
+
+None of this is a *build* dependency. The FUSE binding is pure Rust, so building needs no
+libfuse headers and no pkg-config entry. To build without the direction at all:
+
+```sh
+cargo build --release --no-default-features --features vaapi
+```
+
+Neither absence stops the server. A `file_transfer_mode` of `to-server` or `both` on a
+build without the feature warns and continues as `to-client`, so a stale config file never
+costs you a session. A mount that cannot be created at runtime — no kernel module, no
+helper, no usable runtime directory — is warned about and the paste is skipped; the
+session, the other direction, and text and image clipboard sync all keep working.
 
 ### Options
 

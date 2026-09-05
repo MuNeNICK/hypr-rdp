@@ -11,6 +11,11 @@ mod files;
 mod formats;
 #[cfg(feature = "client-to-server")]
 mod mount;
+// The inbound half of file transfer. Compiled either way rather than gated at
+// the twenty-odd sites in the backend that touch it, which would trade one thin
+// dispatcher for two. Without the direction nothing mounts, so nothing reads,
+// and every seam here is inert.
+#[cfg_attr(not(feature = "client-to-server"), allow(dead_code))]
 mod remote;
 #[cfg(feature = "client-to-server")]
 mod remote_tree;

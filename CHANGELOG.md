@@ -7,6 +7,7 @@
 - Added clipboard file transfer from the Hyprland desktop to the RDP client, carrying whole directory trees over the clipboard channel.
 - Added `file_transfer_mode`, `file_transfer_max_entries`, and `file_transfer_max_chunk_bytes` settings, each also a command-line flag.
 - Added outbound filename adjustment so names illegal on the client's filesystem still arrive, with collisions disambiguated.
+- Added clipboard file transfer from the RDP client to the Hyprland desktop, behind the default-on `client-to-server` build feature. A build or a machine without FUSE warns and serves the desktop-to-client direction alone instead of failing to start.
 
 ## [0.1.5] - 2026-08-19
 

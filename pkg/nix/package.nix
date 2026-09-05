@@ -46,9 +46,24 @@ rustPlatform.buildRustPackage {
     wayland
   ];
 
+  # `fuse3` is deliberately absent from buildInputs and from the wrapper's PATH.
+  # Mounting the client's clipboard files goes through `fusermount3`, which must
+  # be the setuid wrapper NixOS builds in /run/wrappers/bin; the store's own
+  # fusermount3 is not setuid and would shadow it. The FUSE binding is pure Rust,
+  # so nothing links against libfuse and nothing probes for it at build time.
+  #
+  # FUSERMOUNT_PATH names that one wrapper rather than putting all of
+  # /run/wrappers/bin on PATH, which every child the server spawns — pactl, the
+  # session hooks — would inherit. --set-default leaves an operator who exports
+  # their own value in charge.
+  #
+  # The wrapper exists only when `programs.fuse.enable` is on, which is the
+  # default on NixOS 25.11 but not on nixos-unstable. Without it hypr-rdp warns
+  # and serves the desktop-to-client direction alone.
   postInstall = ''
     wrapProgram $out/bin/hypr-rdp \
-      --prefix PATH : ${lib.makeBinPath [ pulseaudio ]}
+      --prefix PATH : ${lib.makeBinPath [ pulseaudio ]} \
+      --set-default FUSERMOUNT_PATH /run/wrappers/bin/fusermount3
   '';
 
   doCheck = false;

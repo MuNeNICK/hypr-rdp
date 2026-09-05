@@ -97,6 +97,9 @@ pub(super) fn to_crlf(text: &str) -> String {
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
     Image(Vec<u8>), // PNG bytes
+    /// Only ever built from a mount, so a build without the client-to-server
+    /// direction carries the variant without constructing it.
+    #[cfg_attr(not(feature = "client-to-server"), allow(dead_code))]
     Files {
         uri_list: Vec<u8>,
         gnome_copied_files: Vec<u8>,

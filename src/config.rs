@@ -27,17 +27,53 @@ impl FileTransferMode {
         matches!(self, Self::ToClient | Self::Both)
     }
 
+    /// Always false on a build without the client-to-server direction compiled
+    /// in, whatever the configuration asked for. [`supported_file_transfer_mode`]
+    /// already degrades such a configuration at startup; this keeps the answer
+    /// honest for anything that builds a mode without going through it.
     pub(crate) fn permits_to_server(self) -> bool {
-        #[cfg(feature = "client-to-server")]
-        {
-            matches!(self, Self::ToServer | Self::Both)
-        }
-        #[cfg(not(feature = "client-to-server"))]
-        {
-            let _ = self;
-            false
-        }
+        cfg!(feature = "client-to-server") && matches!(self, Self::ToServer | Self::Both)
     }
+}
+
+/// The mode this build can actually serve.
+///
+/// The client-to-server direction is an optional build feature, because the
+/// userspace filesystem it mounts through is unavailable on some systems. A
+/// configuration asking for it on a build without it warns and degrades to the
+/// direction that does work, rather than refusing to start: a stale config
+/// file, or a NixOS release that turned the mount helper off, must not cost the
+/// operator their whole server.
+///
+/// `asked_for` says whether the operator actually named the mode, on the
+/// command line or in the config file. The default is `both`, so a build
+/// without the feature degrades on every start; warning about that would be
+/// noise on a binary its packager built exactly as intended. The warning is
+/// for the operator who asked for something this build cannot give them.
+fn supported_file_transfer_mode(mode: FileTransferMode, asked_for: bool) -> FileTransferMode {
+    let (supported, warning) = resolve_file_transfer_mode(mode, asked_for);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    supported
+}
+
+/// The decision [`supported_file_transfer_mode`] makes, separated from the
+/// logging so that both halves — what the server ends up serving, and whether
+/// the operator hears about it — can be asserted on.
+fn resolve_file_transfer_mode(
+    mode: FileTransferMode,
+    asked_for: bool,
+) -> (FileTransferMode, Option<&'static str>) {
+    if cfg!(feature = "client-to-server")
+        || !matches!(mode, FileTransferMode::ToServer | FileTransferMode::Both)
+    {
+        return (mode, None);
+    }
+    let warning = asked_for.then_some(
+        "File transfer to the server is not compiled into this build; continuing with 'to-client'",
+    );
+    (FileTransferMode::ToClient, warning)
 }
 
 #[derive(Parser, Debug)]
@@ -349,12 +385,11 @@ impl RuntimeConfig {
         let output = args.output.or(config.output);
         let on_session_start = args.on_session_start.or(config.on_session_start);
         let on_session_end = args.on_session_end.or(config.on_session_end);
-        let file_transfer_mode = parse_file_transfer_mode(
-            &args
-                .file_transfer_mode
-                .or(config.file_transfer_mode)
-                .unwrap_or_else(|| "both".into()),
-        )?;
+        let requested_file_transfer_mode = args.file_transfer_mode.or(config.file_transfer_mode);
+        let file_transfer_mode = supported_file_transfer_mode(
+            parse_file_transfer_mode(requested_file_transfer_mode.as_deref().unwrap_or("both"))?,
+            requested_file_transfer_mode.is_some(),
+        );
         let file_transfer_max_chunk_bytes = args
             .file_transfer_max_chunk_bytes
             .or(config.file_transfer_max_chunk_bytes)
@@ -684,6 +719,67 @@ mod tests {
         assert!(!FileTransferMode::Off.permits_to_client());
         assert!(!FileTransferMode::ToServer.permits_to_client());
         assert!(parse_file_transfer_mode("invalid").is_err());
+    }
+
+    /// A stale config asking for a direction this build cannot serve must not
+    /// stop the server from starting; it degrades to the direction that works.
+    #[test]
+    fn a_build_without_the_client_to_server_direction_degrades_instead_of_failing() {
+        assert_eq!(
+            supported_file_transfer_mode(FileTransferMode::Off, true),
+            FileTransferMode::Off
+        );
+        assert_eq!(
+            supported_file_transfer_mode(FileTransferMode::ToClient, true),
+            FileTransferMode::ToClient
+        );
+
+        let expected = if cfg!(feature = "client-to-server") {
+            [FileTransferMode::ToServer, FileTransferMode::Both]
+        } else {
+            [FileTransferMode::ToClient, FileTransferMode::ToClient]
+        };
+        assert_eq!(
+            supported_file_transfer_mode(FileTransferMode::ToServer, true),
+            expected[0]
+        );
+        assert_eq!(
+            supported_file_transfer_mode(FileTransferMode::Both, true),
+            expected[1]
+        );
+    }
+
+    /// The default is `both`, so a build without the direction degrades on
+    /// every start. Degrading is right; warning about it is not, on a binary
+    /// whose operator never asked for the direction in the first place.
+    #[test]
+    fn a_default_mode_degrades_on_such_a_build_without_warning_about_it() {
+        let (mode, warning) = resolve_file_transfer_mode(FileTransferMode::Both, false);
+
+        assert_eq!(
+            mode,
+            if cfg!(feature = "client-to-server") {
+                FileTransferMode::Both
+            } else {
+                FileTransferMode::ToClient
+            }
+        );
+        assert_eq!(warning, None, "an untouched default is not worth a warning");
+    }
+
+    /// An operator who did name the direction hears why they are not getting
+    /// it — that is the whole point of degrading rather than failing.
+    #[test]
+    fn a_mode_the_operator_asked_for_warns_when_this_build_cannot_serve_it() {
+        let (mode, warning) = resolve_file_transfer_mode(FileTransferMode::ToServer, true);
+
+        if cfg!(feature = "client-to-server") {
+            assert_eq!(mode, FileTransferMode::ToServer);
+            assert_eq!(warning, None);
+        } else {
+            assert_eq!(mode, FileTransferMode::ToClient);
+            assert!(warning.is_some(), "the operator is told why");
+        }
     }
 
     #[test]

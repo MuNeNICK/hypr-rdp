@@ -896,9 +896,44 @@ mod tests {
         assert_eq!(read.await.unwrap().unwrap(), b"crate");
     }
 
-    /// Gated: without the feature, `permits_to_server` is false and the
-    /// backend never asks for the file list, so the receive below would block
-    /// forever rather than fail.
+    /// A paste the server cannot give the desktop anywhere to read from — no
+    /// mount, because the kernel, the mount helper or the runtime directory
+    /// will not have one — costs the paste and nothing else. The backend
+    /// leaves the clipboard as it was and goes on serving; ending the session
+    /// over it would take the user's whole desktop with it.
+    #[cfg(feature = "client-to-server")]
+    #[test]
+    fn a_paste_with_nowhere_to_land_leaves_the_session_serving() {
+        use ironrdp_cliprdr::pdu::FileDescriptor;
+
+        let (mut backend, mut events) = backend_with_events();
+        // Nothing to advertise the client's files through, which is the same
+        // `None` a mount that cannot be created hands the same join point.
+        assert!(backend.remote_files.is_none());
+
+        backend.on_remote_file_list(&[FileDescriptor::new("report.pdf").with_file_size(3)], None);
+
+        assert!(
+            backend.pending_write.lock().unwrap().is_none(),
+            "nothing is offered to the desktop"
+        );
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(
+            matches!(
+                events.blocking_recv(),
+                Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                    _
+                )))
+            ),
+            "the session still serves the clipboard"
+        );
+    }
+
+    /// Gated: without the client-to-server direction compiled in,
+    /// `permits_to_server` is false whatever the mode says, so the backend
+    /// never asks for the file list and the receive below would block forever
+    /// rather than fail.
     #[cfg(feature = "client-to-server")]
     #[test]
     fn client_file_format_starts_the_delayed_file_list_exchange() {

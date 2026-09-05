@@ -42,7 +42,16 @@ impl RemoteMount {
             tracing::warn!("Clipboard: XDG_RUNTIME_DIR is unset, cannot mount remote files");
             return None;
         };
-        let path = PathBuf::from(runtime_dir).join(mount_dir_name(
+        Self::create_in(Path::new(&runtime_dir), filesystem)
+    }
+
+    /// The mount itself, over an injected runtime directory, so the path a
+    /// system that cannot mount takes is exercised without one.
+    fn create_in<FS: fuser::Filesystem + Send + 'static>(
+        runtime_dir: &Path,
+        filesystem: FS,
+    ) -> Option<Self> {
+        let path = runtime_dir.join(mount_dir_name(
             std::process::id(),
             NEXT_MOUNT.fetch_add(1, Ordering::Relaxed),
         ));
@@ -286,6 +295,10 @@ fn unmount_programs() -> Vec<String> {
             "/sbin/fusermount",
             "/bin/fusermount3",
             "/bin/fusermount",
+            // NixOS keeps its setuid wrappers outside any package path and
+            // outside a minimal unit's PATH, so name them.
+            "/run/wrappers/bin/fusermount3",
+            "/run/wrappers/bin/fusermount",
         ]
         .map(str::to_owned),
     );
@@ -325,6 +338,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// A system that cannot mount — no FUSE, no mount helper, an unusable
+    /// runtime directory — must cost the operator the paste direction and
+    /// nothing else. `create` answering `None` is what lets the caller carry
+    /// on with the session instead of ending it.
+    #[test]
+    fn a_mount_that_cannot_be_created_degrades_to_nothing_rather_than_failing() {
+        struct NoFilesystem;
+        impl fuser::Filesystem for NoFilesystem {}
+
+        let unusable = Path::new("/proc/hypr-rdp-has-no-runtime-directory-here");
+
+        assert!(RemoteMount::create_in(unusable, NoFilesystem).is_none());
+        assert!(!unusable.exists(), "nothing is left behind");
     }
 
     #[test]
