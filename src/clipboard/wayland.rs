@@ -29,15 +29,20 @@ fn data_control_manager_version(advertised_version: u32) -> u32 {
     advertised_version.min(DATA_CONTROL_VERSION)
 }
 
+/// Clipboard state the backend shares with the watcher thread.
+pub(super) struct ClipboardShared {
+    pub(super) event_sender: mpsc::UnboundedSender<ServerEvent>,
+    pub(super) clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
+    pub(super) clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
+    pub(super) pending_write: Arc<Mutex<Option<PendingWrite>>>,
+    pub(super) echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    pub(super) file_selection: FileSelection,
+    pub(super) remote_files: Option<RemoteFiles>,
+}
+
 pub(super) fn clipboard_thread(
-    event_sender: mpsc::UnboundedSender<ServerEvent>,
-    clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
-    clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
-    pending_write: Arc<Mutex<Option<PendingWrite>>>,
-    echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    shared: ClipboardShared,
     running: Arc<AtomicBool>,
-    file_selection: FileSelection,
-    remote_files: Option<RemoteFiles>,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("clipboard: failed to connect to Wayland: {}", e))?;
@@ -47,15 +52,7 @@ pub(super) fn clipboard_thread(
     let display = conn.display();
     let _registry = display.get_registry(&qh, ());
 
-    let mut state = ClipState::new(
-        event_sender,
-        clipboard_data,
-        clipboard_image,
-        pending_write,
-        echo_candidate,
-        file_selection,
-        remote_files,
-    );
+    let mut state = ClipState::new(shared);
 
     let wayland_fd = conn.as_fd().as_raw_fd();
     let ready = dispatch_until_globals_ready(
@@ -188,24 +185,16 @@ struct ActiveSelection {
 }
 
 impl ClipState {
-    fn new(
-        event_sender: mpsc::UnboundedSender<ServerEvent>,
-        clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
-        clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
-        pending_write: Arc<Mutex<Option<PendingWrite>>>,
-        echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
-        file_selection: FileSelection,
-        remote_files: Option<RemoteFiles>,
-    ) -> Self {
+    fn new(shared: ClipboardShared) -> Self {
         Self {
-            event_sender,
+            event_sender: shared.event_sender,
             suppress_echo_until: None,
-            clipboard_data,
-            clipboard_image,
-            pending_write,
-            echo_candidate,
-            file_selection,
-            remote_files,
+            clipboard_data: shared.clipboard_data,
+            clipboard_image: shared.clipboard_image,
+            pending_write: shared.pending_write,
+            echo_candidate: shared.echo_candidate,
+            file_selection: shared.file_selection,
+            remote_files: shared.remote_files,
             manager: None,
             seat: None,
             device: None,
@@ -792,15 +781,15 @@ mod tests {
 
     fn clip_state() -> ClipState {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        ClipState::new(
-            event_tx,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            FileSelection::new(Arc::default(), None),
-            None,
-        )
+        ClipState::new(ClipboardShared {
+            event_sender: event_tx,
+            clipboard_data: Arc::new(Mutex::new(None)),
+            clipboard_image: Arc::new(Mutex::new(None)),
+            pending_write: Arc::new(Mutex::new(None)),
+            echo_candidate: Arc::new(Mutex::new(None)),
+            file_selection: FileSelection::new(Arc::default(), None),
+            remote_files: None,
+        })
     }
 
     #[tokio::test]

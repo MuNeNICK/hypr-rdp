@@ -25,7 +25,7 @@ use super::mount::RemoteMount;
 #[cfg(feature = "client-to-server")]
 use super::remote::uri_payload;
 use super::remote::RemoteFiles;
-use super::wayland::clipboard_thread;
+use super::wayland::{clipboard_thread, ClipboardShared};
 use crate::config::FileTransferMode;
 
 #[derive(Clone, Debug, Default)]
@@ -613,30 +613,24 @@ impl HyprCliprdrBackend {
             None => return,
         };
 
-        let clipboard_data = Arc::clone(&self.clipboard_data);
-        let clipboard_image = Arc::clone(&self.clipboard_image);
-        let pending_write = Arc::clone(&self.pending_write);
-        let echo_candidate = Arc::clone(&self.echo_candidate);
         let running = Arc::clone(&self.running);
-        let file_selection = FileSelection::new(
-            Arc::clone(&self.files),
-            self.to_client_worker().map(|worker| worker.sender()),
-        );
-        let remote_files = self.remote_files.clone();
+        let shared = ClipboardShared {
+            event_sender: sender,
+            clipboard_data: Arc::clone(&self.clipboard_data),
+            clipboard_image: Arc::clone(&self.clipboard_image),
+            pending_write: Arc::clone(&self.pending_write),
+            echo_candidate: Arc::clone(&self.echo_candidate),
+            file_selection: FileSelection::new(
+                Arc::clone(&self.files),
+                self.to_client_worker().map(|worker| worker.sender()),
+            ),
+            remote_files: self.remote_files.clone(),
+        };
 
         match thread::Builder::new()
             .name("clipboard-watcher".into())
             .spawn(move || {
-                if let Err(e) = clipboard_thread(
-                    sender,
-                    clipboard_data,
-                    clipboard_image,
-                    pending_write,
-                    echo_candidate,
-                    running,
-                    file_selection,
-                    remote_files,
-                ) {
+                if let Err(e) = clipboard_thread(shared, running) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
             }) {
