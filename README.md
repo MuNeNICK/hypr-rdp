@@ -286,6 +286,12 @@ all keep working.
 
 Every key is also a command-line flag (`--file-transfer-mode` and so on).
 
+For desktop-to-client copies, the entry limit bounds inspection as well as the
+advertised list. Skipped entries (including special files, cycles, and unreadable
+entries) consume that budget too, so a truncated offer can contain fewer files
+than the limit. A directory is read only up to the remaining budget plus one
+overflow check; the subset retained at the limit depends on filesystem order.
+
 A mode that excludes a direction stops files being *transferred* that way, but not the
 selection's paths, in either direction. A file copied in a Hyprland file manager still
 reaches the client's clipboard as **text** — the `file://` URI list published as ordinary

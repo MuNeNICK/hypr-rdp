@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -29,10 +29,35 @@ pub(super) struct FrozenFile {
     pub(super) descriptor: FileDescriptor,
 }
 
-pub(super) type FrozenFiles = Arc<Mutex<Option<Vec<FrozenFile>>>>;
+#[derive(Default)]
+pub(super) struct FrozenSelection {
+    generation: u64,
+    pub(super) entries: Option<Vec<FrozenFile>>,
+}
+
+impl From<Option<Vec<FrozenFile>>> for FrozenSelection {
+    fn from(entries: Option<Vec<FrozenFile>>) -> Self {
+        Self {
+            generation: 0,
+            entries,
+        }
+    }
+}
+
+pub(super) type FrozenFiles = Arc<Mutex<FrozenSelection>>;
+
+pub(super) fn clear_selection(files: &FrozenFiles) {
+    if let Ok(mut current) = files.lock() {
+        current.generation = current.generation.wrapping_add(1);
+        current.entries = None;
+    }
+}
 
 pub(super) enum FileWorkerCommand {
-    Freeze(Vec<PathBuf>),
+    Freeze {
+        paths: Vec<PathBuf>,
+        generation: u64,
+    },
     Read(FileContentsRequest),
     Stop,
 }
@@ -55,18 +80,9 @@ impl FileWorker {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        FileWorkerCommand::Freeze(paths) => {
+                        FileWorkerCommand::Freeze { paths, generation } => {
                             let frozen = freeze_paths(paths, max_entries);
-                            if let Ok(mut current) = files.lock() {
-                                *current = (!frozen.is_empty()).then_some(frozen.clone());
-                            }
-                            if !frozen.is_empty() {
-                                let descriptors =
-                                    frozen.into_iter().map(|file| file.descriptor).collect();
-                                let _ = event_sender.send(ServerEvent::Clipboard(
-                                    ClipboardMessage::SendInitiateFileCopy(descriptors),
-                                ));
-                            }
+                            publish_selection(&files, generation, frozen, &event_sender);
                         }
                         FileWorkerCommand::Read(request) => {
                             let response = read_file_contents(&files, request, max_chunk_bytes);
@@ -91,6 +107,27 @@ impl FileWorker {
 
     pub(super) fn sender(&self) -> mpsc::Sender<FileWorkerCommand> {
         self.sender.clone()
+    }
+}
+
+fn publish_selection(
+    files: &FrozenFiles,
+    generation: u64,
+    frozen: Vec<FrozenFile>,
+    event_sender: &UnboundedSender<ServerEvent>,
+) {
+    if let Ok(mut current) = files.lock() {
+        if current.generation != generation {
+            return;
+        }
+        // Serialize publication with invalidation, including the event enqueue.
+        current.entries = (!frozen.is_empty()).then_some(frozen.clone());
+        if !frozen.is_empty() {
+            let descriptors = frozen.into_iter().map(|file| file.descriptor).collect();
+            let _ = event_sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendInitiateFileCopy(descriptors),
+            ));
+        }
     }
 }
 
@@ -123,9 +160,7 @@ impl FileSelection {
 
     /// Forget the frozen selection so the client can no longer read it.
     pub(super) fn clear(&self) {
-        if let Ok(mut frozen) = self.frozen.lock() {
-            *frozen = None;
-        }
+        clear_selection(&self.frozen);
     }
 
     /// Hand a new selection to the file worker, which freezes it off this
@@ -136,7 +171,13 @@ impl FileSelection {
         let Some(worker) = self.worker.as_ref().filter(|_| !paths.is_empty()) else {
             return false;
         };
-        if let Err(error) = worker.send(FileWorkerCommand::Freeze(paths)) {
+        let Ok(mut current) = self.frozen.lock() else {
+            return false;
+        };
+        current.generation = current.generation.wrapping_add(1);
+        current.entries = None;
+        let generation = current.generation;
+        if let Err(error) = worker.send(FileWorkerCommand::Freeze { paths, generation }) {
             tracing::warn!(%error, "Clipboard: file worker is gone; offering the selection as text");
             return false;
         }
@@ -153,6 +194,11 @@ pub(super) fn freeze_paths(paths: Vec<PathBuf>, max_entries: usize) -> Vec<Froze
     let mut walk = Walk::new(max_entries);
     let mut paths = paths.into_iter();
     for path in paths.by_ref() {
+        if walk.remaining == 0 {
+            walk.truncated = true;
+            break;
+        }
+        walk.remaining -= 1;
         walk.freeze_path(&path, &[], 0);
         if walk.is_full() {
             break;
@@ -174,12 +220,13 @@ pub(super) fn freeze_paths(paths: Vec<PathBuf>, max_entries: usize) -> Vec<Froze
 /// One recursive enumeration of a clipboard selection.
 ///
 /// Carries the state the walk threads through every level: the entry ceiling,
-/// the directories already visited (which bounds symlink cycles), the names
+/// the directories on the current ancestor chain (which bounds symlink cycles), the names
 /// already handed out per directory, and whether the ceiling actually cost us
 /// an entry.
 struct Walk {
     max_entries: usize,
-    visited_directories: HashSet<(u64, u64)>,
+    remaining: usize,
+    ancestor_directories: HashSet<(u64, u64)>,
     used_names: HashMap<Vec<String>, HashSet<String>>,
     files: Vec<FrozenFile>,
     truncated: bool,
@@ -189,7 +236,8 @@ impl Walk {
     fn new(max_entries: usize) -> Self {
         Self {
             max_entries,
-            visited_directories: HashSet::new(),
+            remaining: max_entries,
+            ancestor_directories: HashSet::new(),
             used_names: HashMap::new(),
             files: Vec::new(),
             truncated: false,
@@ -238,13 +286,14 @@ impl Walk {
         }
 
         if !self
-            .visited_directories
+            .ancestor_directories
             .insert((metadata.dev(), metadata.ino()))
         {
             tracing::warn!(?path, "Clipboard: skipping directory symlink cycle");
             return;
         }
 
+        let identity = (metadata.dev(), metadata.ino());
         let name = self.unique_name(parent, path);
         self.files.push(frozen_file(
             path.to_path_buf(),
@@ -254,6 +303,11 @@ impl Walk {
             ClipboardFileAttributes::DIRECTORY,
         ));
 
+        self.freeze_children(path, parent, name, depth);
+        self.ancestor_directories.remove(&identity);
+    }
+
+    fn freeze_children(&mut self, path: &Path, parent: &[String], name: String, depth: usize) {
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -261,15 +315,8 @@ impl Walk {
                 return;
             }
         };
-        let mut children: Vec<_> = entries
-            .filter_map(|entry| match entry {
-                Ok(entry) => Some(entry.path()),
-                Err(error) => {
-                    tracing::warn!(?path, %error, "Clipboard: cannot read directory entry");
-                    None
-                }
-            })
-            .collect();
+        let mut children =
+            self.collect_children(path, entries.map(|entry| entry.map(|entry| entry.path())));
         children.sort();
         let mut relative_path = parent.to_vec();
         relative_path.push(name);
@@ -285,6 +332,30 @@ impl Walk {
             }
             self.freeze_path(child, &relative_path, depth + 1);
         }
+    }
+
+    fn collect_children(
+        &mut self,
+        path: &Path,
+        entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    ) -> Vec<PathBuf> {
+        let mut children = Vec::new();
+        for entry in entries {
+            if self.remaining == 0 {
+                self.truncated = true;
+                break;
+            }
+            // Bound inspected entries, including skipped/error entries, not
+            // just the descriptors eventually emitted. Reserve each slot once.
+            self.remaining -= 1;
+            match entry {
+                Ok(entry) => children.push(entry),
+                Err(error) => {
+                    tracing::warn!(?path, %error, "Clipboard: cannot read directory entry");
+                }
+            }
+        }
+        children
     }
 
     fn unique_name(&mut self, parent: &[String], path: &Path) -> String {
@@ -412,15 +483,37 @@ fn read_file_contents(
     request: FileContentsRequest,
     max_chunk_bytes: u32,
 ) -> FileContentsResponse<'static> {
+    read_file_contents_with_open(files, request, max_chunk_bytes, open_source)
+}
+
+fn open_source(path: &Path) -> std::io::Result<File> {
+    // A path replaced by a FIFO must not block open. Symlinks remain supported.
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+fn read_file_contents_with_open(
+    files: &FrozenFiles,
+    request: FileContentsRequest,
+    max_chunk_bytes: u32,
+    open: impl FnOnce(&Path) -> std::io::Result<File>,
+) -> FileContentsResponse<'static> {
     let error = || FileContentsResponse::new_error(request.stream_id);
     let Some(file) = files.lock().ok().and_then(|files| {
         files
+            .entries
             .as_ref()
             .and_then(|files| files.get(request.index as usize).cloned())
     }) else {
         return error();
     };
-    let Ok(metadata) = std::fs::metadata(&file.path) else {
+    // Validate the opened object, not a separate lookup of a mutable path.
+    let Ok(mut source) = open(&file.path) else {
+        return error();
+    };
+    let Ok(metadata) = source.metadata() else {
         return error();
     };
     if metadata.dev() != file.device || metadata.ino() != file.inode || !metadata.is_file() {
@@ -434,9 +527,6 @@ fn read_file_contents(
         return error();
     }
     let mut data = vec![0; request.requested_size as usize];
-    let Ok(mut source) = File::open(&file.path) else {
-        return error();
-    };
     if source.seek(SeekFrom::Start(request.position)).is_err() {
         return error();
     }
@@ -468,6 +558,116 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn a_path_swapped_during_open_never_serves_the_replacement() {
+        let root = std::env::temp_dir().join(format!("hypr-rdp-open-race-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("selected");
+        std::fs::write(&path, b"selected bytes").unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(freeze_regular_files(vec![path.clone()])).into(),
+        ));
+        for flags in [FileContentsFlags::RANGE, FileContentsFlags::SIZE] {
+            let response =
+                read_file_contents_with_open(&files, request(0, flags, 0, 8), 64, |path| {
+                    // Preserve the original inode so allocator reuse cannot mask the swap.
+                    std::fs::rename(path, root.join("original")).unwrap();
+                    std::fs::write(path, b"unselected secret").unwrap();
+                    open_source(path)
+                });
+            assert!(response.is_error());
+            std::fs::rename(root.join("original"), &path).unwrap();
+        }
+        // Swapping to a FIFO must also return, without waiting for a writer.
+        std::fs::rename(&path, root.join("original")).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(
+            read_file_contents(&files, request(0, FileContentsFlags::RANGE, 0, 8), 64).is_error()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_aliases_are_copied_but_ancestor_cycles_are_skipped() {
+        let root = std::env::temp_dir().join(format!("hypr-rdp-aliases-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/file"), b"contents").unwrap();
+        std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("real/cycle")).unwrap();
+        let frozen = freeze_paths(vec![root.clone()], 100);
+        let paths: Vec<_> = frozen
+            .iter()
+            .map(|file| file.path.strip_prefix(&root).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new(""),
+                Path::new("alias"),
+                Path::new("alias/file"),
+                Path::new("real"),
+                Path::new("real/file")
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_inspection_stops_at_the_budget_even_for_errors() {
+        for errors in [false, true] {
+            let mut inspected = 0;
+            let entries = std::iter::repeat_with(|| {
+                inspected += 1;
+                assert!(
+                    inspected <= 4,
+                    "enumerated past the budget and overflow probe"
+                );
+                if errors {
+                    Err(std::io::Error::other("unreadable entry"))
+                } else {
+                    Ok(PathBuf::from("child"))
+                }
+            });
+            let mut walk = Walk::new(3);
+            let children = walk.collect_children(Path::new("parent"), entries);
+            assert_eq!(children.len(), if errors { 0 } else { 3 });
+            assert_eq!(inspected, 4);
+            assert_eq!(walk.remaining, 0);
+            assert!(walk.truncated);
+        }
+    }
+
+    #[test]
+    fn a_completed_walk_cannot_publish_after_clear_or_a_new_freeze() {
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-stale-freeze-{}", std::process::id()));
+        std::fs::write(&path, b"old selection").unwrap();
+        for newer_freeze in [false, true] {
+            let files: FrozenFiles = Arc::default();
+            let (sender, commands) = mpsc::channel();
+            let selection = FileSelection::new(files.clone(), Some(sender));
+            assert!(selection.freeze(vec![path.clone()]));
+            let FileWorkerCommand::Freeze { paths, generation } = commands.recv().unwrap() else {
+                panic!()
+            };
+            let result = freeze_paths(paths, 100);
+            if newer_freeze {
+                assert!(selection.freeze(vec![path.clone()]));
+            } else {
+                selection.clear();
+            }
+            let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            publish_selection(&files, generation, result, &events);
+            assert!(files.lock().unwrap().entries.is_none());
+            assert!(
+                receiver.try_recv().is_err(),
+                "stale offer reached the client"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn request(
         index: i32,
         flags: FileContentsFlags,
@@ -491,8 +691,9 @@ mod tests {
             .unwrap()
             .write_all(b"clipboard bytes")
             .unwrap();
-        let files: FrozenFiles =
-            Arc::new(Mutex::new(Some(freeze_regular_files(vec![path.clone()]))));
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(freeze_regular_files(vec![path.clone()])).into(),
+        ));
         let size = read_file_contents(&files, request(0, FileContentsFlags::SIZE, 0, 8), 64);
         assert_eq!(size.data_as_size().unwrap(), 15);
         let range = read_file_contents(&files, request(0, FileContentsFlags::RANGE, 10, 64), 64);
@@ -506,8 +707,9 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("hypr-rdp-file-reject-test-{}", std::process::id()));
         File::create(&path).unwrap().write_all(b"first").unwrap();
-        let files: FrozenFiles =
-            Arc::new(Mutex::new(Some(freeze_regular_files(vec![path.clone()]))));
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(freeze_regular_files(vec![path.clone()])).into(),
+        ));
         assert!(
             read_file_contents(&files, request(1, FileContentsFlags::SIZE, 0, 8), 4).is_error()
         );
@@ -524,17 +726,17 @@ mod tests {
 
     #[test]
     fn freezes_a_selection_only_when_transfer_is_on_and_paths_remain() {
-        let frozen: FrozenFiles = Arc::new(Mutex::new(Some(Vec::new())));
+        let frozen: FrozenFiles = Arc::new(Mutex::new(Some(Vec::new()).into()));
         let (sender, receiver) = mpsc::channel();
         let selection = FileSelection::new(Arc::clone(&frozen), Some(sender));
 
         selection.clear();
-        assert!(frozen.lock().unwrap().is_none());
+        assert!(frozen.lock().unwrap().entries.is_none());
         assert!(!selection.freeze(Vec::new()));
         assert!(selection.freeze(vec![PathBuf::from("/nonexistent")]));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(FileWorkerCommand::Freeze(paths)) if paths == [PathBuf::from("/nonexistent")]
+            Ok(FileWorkerCommand::Freeze { paths, .. }) if paths == [PathBuf::from("/nonexistent")]
         ));
 
         let disabled = FileSelection::new(Arc::clone(&frozen), None);

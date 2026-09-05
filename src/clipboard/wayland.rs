@@ -21,6 +21,7 @@ use super::formats::{
     PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME,
     MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
 };
+use super::remote::RemoteFiles;
 
 const DATA_CONTROL_VERSION: u32 = 1;
 
@@ -36,6 +37,7 @@ pub(super) fn clipboard_thread(
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     running: Arc<AtomicBool>,
     file_selection: FileSelection,
+    remote_files: Option<RemoteFiles>,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("clipboard: failed to connect to Wayland: {}", e))?;
@@ -52,6 +54,7 @@ pub(super) fn clipboard_thread(
         pending_write,
         echo_candidate,
         file_selection,
+        remote_files,
     );
 
     let wayland_fd = conn.as_fd().as_raw_fd();
@@ -169,6 +172,7 @@ struct ClipState {
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     file_selection: FileSelection,
+    remote_files: Option<RemoteFiles>,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -191,6 +195,7 @@ impl ClipState {
         pending_write: Arc<Mutex<Option<PendingWrite>>>,
         echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
         file_selection: FileSelection,
+        remote_files: Option<RemoteFiles>,
     ) -> Self {
         Self {
             event_sender,
@@ -200,6 +205,7 @@ impl ClipState {
             pending_write,
             echo_candidate,
             file_selection,
+            remote_files,
             manager: None,
             seat: None,
             device: None,
@@ -219,6 +225,13 @@ impl ClipState {
             *image = None;
         }
         self.file_selection.clear();
+    }
+
+    fn local_owner_changed(&self) {
+        self.file_selection.clear();
+        if let Some(remote_files) = &self.remote_files {
+            remote_files.cancel_pending();
+        }
     }
 
     /// Take one pending write and arm suppression before replacing its source.
@@ -339,6 +352,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     return;
                 }
 
+                state.local_owner_changed();
                 if let Ok(mut candidate) = state.echo_candidate.lock() {
                     *candidate = None;
                 }
@@ -388,10 +402,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 }
 
-                if files_mime.is_none() {
-                    state.file_selection.clear();
-                }
-
                 if let Some(ref mime) = text_mime {
                     if let Some(data) = read_offer_data(&offer, mime, conn) {
                         if !data.is_empty() {
@@ -433,7 +443,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 
                 if let Some(ref mime) = files_mime {
                     if let Some(uri_list) = read_offer_data(&offer, mime, conn) {
-                        state.file_selection.clear();
                         if !state.file_selection.freeze(uri_list_paths(&uri_list))
                             && text_mime.is_none()
                             && !uri_list.is_empty()
@@ -789,8 +798,24 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            FileSelection::new(Arc::new(Mutex::new(None)), None),
+            FileSelection::new(Arc::default(), None),
+            None,
         )
+    }
+
+    #[tokio::test]
+    async fn a_local_owner_change_cancels_a_pending_client_read() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let remote = RemoteFiles::new(events, 100);
+        let read = remote.read(0, 0, 1);
+        receiver.recv().await.expect("remote range was requested");
+        let mut state = clip_state();
+        state.remote_files = Some(remote);
+        state.local_owner_changed();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), read).await,
+            Ok(Ok(Err(())))
+        ));
     }
 
     #[test]

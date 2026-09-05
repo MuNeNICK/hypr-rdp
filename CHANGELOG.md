@@ -14,6 +14,11 @@
 
 ### Fixed
 
+- Fixed stale directory walks re-advertising files after the clipboard selection changed.
+- Fixed file identity validation to check the opened file and reject replacements, including FIFOs without blocking.
+- Bounded directory inspection and buffering by the entry limit, including skipped entries.
+- Fixed directory symlink aliases being mistaken for ancestor cycles and omitted from transfers.
+- Fixed pending client-file reads not being cancelled when the desktop clipboard owner changes.
 - Fixed only the first file copy on the client reaching the desktop in a session. The request state that dedupes repeated announcements of one clipboard selection was cleared when an ordinary format answer arrived but not when a file list did, so every later file copy was dropped as a repeat and the mount kept serving the first selection.
 
 ## [0.1.5] - 2026-08-19

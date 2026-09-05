@@ -15,7 +15,7 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::files::{FileSelection, FileWorker, FileWorkerCommand, FrozenFiles};
+use super::files::{clear_selection, FileSelection, FileWorker, FileWorkerCommand, FrozenFiles};
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
@@ -113,7 +113,7 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
         let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
         let running = Arc::new(AtomicBool::new(true));
-        let files: FrozenFiles = Arc::new(Mutex::new(None));
+        let files: FrozenFiles = Arc::default();
         let file_worker = self.event_sender.as_ref().map(|sender| {
             FileWorker::start(
                 Arc::clone(&files),
@@ -243,7 +243,12 @@ impl CliprdrBackend for HyprCliprdrBackend {
             }
         }
         if self.file_transfer_mode.permits_to_client() {
-            if let Some(files) = self.files.lock().ok().and_then(|files| files.clone()) {
+            if let Some(files) = self
+                .files
+                .lock()
+                .ok()
+                .and_then(|files| files.entries.clone())
+            {
                 if let Some(sender) = &self.event_sender {
                     let descriptors = files.into_iter().map(|file| file.descriptor).collect();
                     let _ = sender.send(ServerEvent::Clipboard(
@@ -266,6 +271,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
+        clear_selection(&self.files);
         if let Some(remote_files) = &self.remote_files {
             remote_files.cancel_pending();
         }
@@ -616,6 +622,7 @@ impl HyprCliprdrBackend {
             Arc::clone(&self.files),
             self.to_client_worker().map(|worker| worker.sender()),
         );
+        let remote_files = self.remote_files.clone();
 
         match thread::Builder::new()
             .name("clipboard-watcher".into())
@@ -628,6 +635,7 @@ impl HyprCliprdrBackend {
                     echo_candidate,
                     running,
                     file_selection,
+                    remote_files,
                 ) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
@@ -675,7 +683,7 @@ mod tests {
                 last_requested_format: None,
                 pending_echo_candidate: None,
                 file_transfer_mode: FileTransferMode::Both,
-                files: Arc::new(Mutex::new(None)),
+                files: Arc::default(),
                 file_worker: None,
                 remote_files: None,
                 #[cfg(feature = "client-to-server")]
@@ -725,9 +733,12 @@ mod tests {
             .unwrap()
             .write_all(b"clipboard bytes")
             .unwrap();
-        let files: FrozenFiles = Arc::new(Mutex::new(Some(
-            super::super::files::freeze_regular_files(vec![path.clone()]),
-        )));
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(super::super::files::freeze_regular_files(
+                vec![path.clone()],
+            ))
+            .into(),
+        ));
         let worker = FileWorker::start(Arc::clone(&files), event_tx.clone(), 8, 100);
         let mut backend = HyprCliprdrBackend {
             event_sender: Some(event_tx),
@@ -1041,7 +1052,10 @@ mod tests {
             1024,
             10,
         );
-        worker.send(FileWorkerCommand::Freeze(vec![root.clone()]));
+        worker.send(FileWorkerCommand::Freeze {
+            paths: vec![root.clone()],
+            generation: 0,
+        });
 
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
@@ -1098,7 +1112,10 @@ mod tests {
             1024,
             3,
         );
-        worker.send(FileWorkerCommand::Freeze(vec![root.clone()]));
+        worker.send(FileWorkerCommand::Freeze {
+            paths: vec![root.clone()],
+            generation: 0,
+        });
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
         else {
@@ -1114,18 +1131,11 @@ mod tests {
             .unwrap()
             .to_file_list()
             .unwrap();
-        assert_eq!(
-            truncated
-                .files
-                .iter()
-                .map(|descriptor| descriptor.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                root_name,
-                &format!("{root_name}\\nested"),
-                &format!("{root_name}\\nested\\empty"),
-            ]
-        );
+        // The work budget counts inspected entries, including skipped sockets
+        // and cycles. Which child survives depends on read_dir order.
+        assert!((2..=3).contains(&truncated.files.len()));
+        assert_eq!(truncated.files[0].name, root_name);
+        assert_eq!(truncated.files[1].name, format!("{root_name}\\nested"));
 
         drop(worker);
         drop(socket);
@@ -1156,7 +1166,7 @@ mod tests {
             path
         })
         .collect();
-        *backend.files.lock().unwrap() = Some(super::super::files::freeze_paths(paths, 100));
+        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_paths(paths, 100));
 
         backend.on_request_format_list();
 
