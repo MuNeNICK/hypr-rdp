@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
-use super::files::{uri_list_paths, FileWorkerCommand, FrozenFiles};
+use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
     PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
     UTF8_MIME,
@@ -36,9 +35,7 @@ pub(super) fn clipboard_thread(
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     running: Arc<AtomicBool>,
-    files: FrozenFiles,
-    file_worker_sender: Option<Sender<FileWorkerCommand>>,
-    file_transfer_enabled: bool,
+    file_selection: FileSelection,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("clipboard: failed to connect to Wayland: {}", e))?;
@@ -54,9 +51,7 @@ pub(super) fn clipboard_thread(
         clipboard_image,
         pending_write,
         echo_candidate,
-        files,
-        file_worker_sender,
-        file_transfer_enabled,
+        file_selection,
     );
 
     let wayland_fd = conn.as_fd().as_raw_fd();
@@ -168,9 +163,7 @@ struct ClipState {
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
-    files: FrozenFiles,
-    file_worker_sender: Option<Sender<FileWorkerCommand>>,
-    file_transfer_enabled: bool,
+    file_selection: FileSelection,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -192,9 +185,7 @@ impl ClipState {
         clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
         pending_write: Arc<Mutex<Option<PendingWrite>>>,
         echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
-        files: FrozenFiles,
-        file_worker_sender: Option<Sender<FileWorkerCommand>>,
-        file_transfer_enabled: bool,
+        file_selection: FileSelection,
     ) -> Self {
         Self {
             event_sender,
@@ -203,9 +194,7 @@ impl ClipState {
             clipboard_image,
             pending_write,
             echo_candidate,
-            files,
-            file_worker_sender,
-            file_transfer_enabled,
+            file_selection,
             manager: None,
             seat: None,
             device: None,
@@ -213,6 +202,18 @@ impl ClipState {
             active_selection: None,
             active_source: None,
         }
+    }
+
+    /// Forget every cached format, so nothing from the previous selection stays
+    /// advertisable after the compositor has replaced it.
+    fn clear_cached_selection(&self) {
+        if let Ok(mut data) = self.clipboard_data.lock() {
+            *data = None;
+        }
+        if let Ok(mut image) = self.clipboard_image.lock() {
+            *image = None;
+        }
+        self.file_selection.clear();
     }
 
     /// Take one pending write and arm suppression before replacing its source.
@@ -340,15 +341,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 let offer = match id {
                     Some(offer) => offer,
                     None => {
-                        if let Ok(mut g) = state.clipboard_data.lock() {
-                            *g = None;
-                        }
-                        if let Ok(mut g) = state.clipboard_image.lock() {
-                            *g = None;
-                        }
-                        if let Ok(mut files) = state.files.lock() {
-                            *files = None;
-                        }
+                        state.clear_cached_selection();
                         return;
                     }
                 };
@@ -369,12 +362,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 
                 if text_mime.is_none() && image_mime.is_none() && files_mime.is_none() {
                     // No supported MIME — clear stale caches
-                    if let Ok(mut g) = state.clipboard_data.lock() {
-                        *g = None;
-                    }
-                    if let Ok(mut g) = state.clipboard_image.lock() {
-                        *g = None;
-                    }
+                    state.clear_cached_selection();
                     offer.destroy();
                     return;
                 }
@@ -395,10 +383,8 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 }
 
-                if !state.file_transfer_enabled || files_mime.is_none() {
-                    if let Ok(mut files) = state.files.lock() {
-                        *files = None;
-                    }
+                if files_mime.is_none() {
+                    state.file_selection.clear();
                 }
 
                 if let Some(ref mime) = text_mime {
@@ -442,15 +428,11 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 
                 if let Some(ref mime) = files_mime {
                     if let Some(uri_list) = read_offer_data(&offer, mime, conn) {
-                        let paths = uri_list_paths(&uri_list);
-                        if let Ok(mut files) = state.files.lock() {
-                            *files = None;
-                        }
-                        if state.file_transfer_enabled && !paths.is_empty() {
-                            if let Some(worker) = &state.file_worker_sender {
-                                let _ = worker.send(FileWorkerCommand::Freeze(paths));
-                            }
-                        } else if text_mime.is_none() && !uri_list.is_empty() {
+                        state.file_selection.clear();
+                        if !state.file_selection.freeze(uri_list_paths(&uri_list))
+                            && text_mime.is_none()
+                            && !uri_list.is_empty()
+                        {
                             // URI lists without file entries remain ordinary text clipboard data.
                             if let Ok(mut data) = state.clipboard_data.lock() {
                                 *data = Some(uri_list);
@@ -800,9 +782,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            None,
-            true,
+            FileSelection::new(Arc::new(Mutex::new(None)), None),
         )
     }
 

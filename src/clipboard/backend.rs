@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
-#[cfg(test)]
-use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::files::{FileWorker, FileWorkerCommand, FrozenFiles};
+use super::files::{FileSelection, FileWorker, FileWorkerCommand, FrozenFiles};
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
@@ -311,11 +311,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        if self.file_transfer_mode.permits_to_client() {
-            if let Some(worker) = &self.file_worker {
-                worker.send(FileWorkerCommand::Read(request));
-                return;
-            }
+        if let Some(worker) = self.to_client_worker() {
+            worker.send(FileWorkerCommand::Read(request));
+            return;
         }
         if let Some(sender) = &self.event_sender {
             let _ = sender.send(ServerEvent::Clipboard(
@@ -334,6 +332,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    /// The file worker, but only while this session may copy files to the client.
+    fn to_client_worker(&self) -> Option<&FileWorker> {
+        self.file_worker
+            .as_ref()
+            .filter(|_| self.file_transfer_mode.permits_to_client())
+    }
+
     fn has_local_selection(&self, kind: SelectionKind) -> bool {
         match kind {
             SelectionKind::Text => self
@@ -502,9 +507,10 @@ impl HyprCliprdrBackend {
         let pending_write = Arc::clone(&self.pending_write);
         let echo_candidate = Arc::clone(&self.echo_candidate);
         let running = Arc::clone(&self.running);
-        let files = Arc::clone(&self.files);
-        let file_worker_sender = self.file_worker.as_ref().map(|worker| worker.sender());
-        let file_transfer_enabled = self.file_transfer_mode.permits_to_client();
+        let file_selection = FileSelection::new(
+            Arc::clone(&self.files),
+            self.to_client_worker().map(|worker| worker.sender()),
+        );
 
         match thread::Builder::new()
             .name("clipboard-watcher".into())
@@ -516,9 +522,7 @@ impl HyprCliprdrBackend {
                     pending_write,
                     echo_candidate,
                     running,
-                    files,
-                    file_worker_sender,
-                    file_transfer_enabled,
+                    file_selection,
                 ) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
@@ -537,7 +541,7 @@ impl HyprCliprdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironrdp_cliprdr::pdu::FileDescriptor;
+    use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileDescriptor};
     use proptest::prelude::*;
     use std::io::{Cursor, Write};
     use std::os::unix::ffi::OsStringExt;
@@ -671,22 +675,41 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn file_worker_offers_a_bounded_directory_tree() {
-        let root = std::path::PathBuf::from("/tmp")
-            .join(format!("hrdp-worker-folder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    /// Builds a directory tree carrying every enumeration hazard ticket 04
+    /// names: an empty directory, a symlink to a file, a symlink cycle back to
+    /// the root, a FIFO, and a socket. Enumerating `root` must yield exactly the
+    /// root, `nested`, `nested/empty`, `nested/document.txt`, and
+    /// `nested/shortcut.txt`.
+    ///
+    /// Returns the bound socket, which the caller must keep alive for the walk.
+    fn build_hazardous_tree(root: &std::path::Path) -> std::os::unix::net::UnixDatagram {
+        let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(root.join("nested/empty")).unwrap();
         std::fs::File::create(root.join("nested/document.txt"))
             .unwrap()
             .write_all(b"contents")
             .unwrap();
-        std::os::unix::fs::symlink(&root, root.join("nested/loop")).unwrap();
-        let fifo = root.join("nested/ignored-fifo");
-        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
-        let socket = std::os::unix::net::UnixDatagram::bind(root.join("nested/ignored-socket"))
-            .unwrap();
+        std::os::unix::fs::symlink(root, root.join("nested/loop")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("nested/document.txt"),
+            root.join("nested/shortcut.txt"),
+        )
+        .unwrap();
+        let fifo = std::ffi::CString::new(
+            root.join("nested/ignored-fifo")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::net::UnixDatagram::bind(root.join("nested/ignored-socket")).unwrap()
+    }
+
+    #[test]
+    fn file_worker_offers_a_bounded_directory_tree() {
+        let root =
+            std::env::temp_dir().join(format!("hypr-rdp-file-worker-{}", std::process::id()));
+        let socket = build_hazardous_tree(&root);
 
         let (mut backend, mut events) = backend_with_events();
         let worker = FileWorker::start(
@@ -724,6 +747,23 @@ mod tests {
                 &format!("{root_name}\\nested"),
                 &format!("{root_name}\\nested\\empty"),
                 &format!("{root_name}\\nested\\document.txt"),
+                &format!("{root_name}\\nested\\shortcut.txt"),
+            ]
+        );
+        // Directories arrive as directories and carry no content length; the
+        // symlink arrives as the file it points at.
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| (descriptor.attributes, descriptor.file_size))
+                .collect::<Vec<_>>(),
+            [
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
             ]
         );
 
@@ -747,12 +787,21 @@ mod tests {
         else {
             panic!("expected the backend to re-advertise the truncated file offer");
         };
+        let truncated = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
         assert_eq!(
-            descriptors
+            truncated
+                .files
                 .iter()
                 .map(|descriptor| descriptor.name.as_str())
                 .collect::<Vec<_>>(),
-            [root.file_name().unwrap().to_str().unwrap(), "nested", "empty"]
+            [
+                root_name,
+                &format!("{root_name}\\nested"),
+                &format!("{root_name}\\nested\\empty"),
+            ]
         );
 
         drop(worker);
