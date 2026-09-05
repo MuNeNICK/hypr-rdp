@@ -27,6 +27,9 @@ pub struct ServerContext {
 }
 
 pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
+    // Before anything mounts: a previous run that exited abnormally leaves its
+    // clipboard mount behind, and only a later start can clear it.
+    crate::clipboard::sweep_orphan_mounts();
     let hyprland_instance =
         crate::hyprland::initialize().context("failed to select the Hyprland instance")?;
     let RuntimeConfig {

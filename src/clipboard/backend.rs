@@ -20,6 +20,10 @@ use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
 };
+#[cfg(feature = "client-to-server")]
+use super::mount::RemoteMount;
+#[cfg(feature = "client-to-server")]
+use super::remote::uri_payload;
 use super::remote::RemoteFiles;
 use super::wayland::clipboard_thread;
 use crate::config::FileTransferMode;
@@ -138,6 +142,8 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             files,
             file_worker,
             remote_files,
+            #[cfg(feature = "client-to-server")]
+            mount: None,
         })
     }
 }
@@ -159,6 +165,12 @@ struct HyprCliprdrBackend {
     files: FrozenFiles,
     file_worker: Option<FileWorker>,
     remote_files: Option<RemoteFiles>,
+    /// This session's mount, created the first time the client advertises
+    /// files. Owned here rather than by [`RemoteFiles`], which the mount's own
+    /// filesystem holds: owning it there would be a cycle, and a mount inside
+    /// a cycle is never dropped and so never unmounted.
+    #[cfg(feature = "client-to-server")]
+    mount: Option<RemoteMount>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -175,9 +187,14 @@ impl fmt::Debug for HyprCliprdrBackend {
 impl Drop for HyprCliprdrBackend {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Cancel before unmounting: a read still waiting on the client would
+        // otherwise hold the kernel until its timeout, on a connection this
+        // drop is already tearing down.
         if let Some(remote_files) = &self.remote_files {
             remote_files.cancel_pending();
         }
+        #[cfg(feature = "client-to-server")]
+        drop(self.mount.take());
         if let Some(handle) = self.watcher_thread.take() {
             let _ = handle.join();
         }
@@ -366,11 +383,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
         if !self.file_transfer_mode.permits_to_server() {
             return;
         }
-        let Some(remote_files) = &self.remote_files else {
-            tracing::warn!("Clipboard: client-to-server file transfer is unavailable");
-            return;
-        };
-        let Some(pending) = remote_files.advertise(files) else {
+        let Some(pending) = self.advertise_remote_files(files) else {
             return;
         };
         if let Ok(mut pending_write) = self.pending_write.lock() {
@@ -384,6 +397,38 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    /// Records the client's selection and offers it to the Wayland clipboard
+    /// as URIs under this session's mount, mounting on the first selection
+    /// that holds anything pasteable.
+    #[cfg(feature = "client-to-server")]
+    fn advertise_remote_files(
+        &mut self,
+        files: &[ironrdp_cliprdr::pdu::FileDescriptor],
+    ) -> Option<PendingWrite> {
+        let Some(remote_files) = self.remote_files.clone() else {
+            tracing::warn!("Clipboard: client-to-server file transfer is unavailable");
+            return None;
+        };
+        let roots = remote_files.accept(files);
+        if roots.is_empty() {
+            tracing::warn!("Clipboard: the client's file list held nothing that can be pasted");
+            return None;
+        }
+        if self.mount.is_none() {
+            self.mount = Some(RemoteMount::create(remote_files.filesystem())?);
+        }
+        uri_payload(self.mount.as_ref()?.path(), &roots)
+    }
+
+    #[cfg(not(feature = "client-to-server"))]
+    fn advertise_remote_files(
+        &mut self,
+        _files: &[ironrdp_cliprdr::pdu::FileDescriptor],
+    ) -> Option<PendingWrite> {
+        tracing::warn!("Clipboard: client-to-server file transfer is not compiled in");
+        None
+    }
+
     /// The file worker, but only while this session may copy files to the client.
     fn to_client_worker(&self) -> Option<&FileWorker> {
         self.file_worker
@@ -625,9 +670,25 @@ mod tests {
                 files: Arc::new(Mutex::new(None)),
                 file_worker: None,
                 remote_files: None,
+                #[cfg(feature = "client-to-server")]
+                mount: None,
             },
             event_rx,
         )
+    }
+
+    /// A backend wired to remote files a test can drive directly, which is how
+    /// the inbound direction is exercised without a mount. Must be called from
+    /// inside a runtime: the remote files capture the current handle.
+    fn backend_with_remote_files() -> (
+        HyprCliprdrBackend,
+        RemoteFiles,
+        mpsc::UnboundedReceiver<ServerEvent>,
+    ) {
+        let (mut backend, events) = backend_with_events();
+        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
+        backend.remote_files = Some(remote_files.clone());
+        (backend, remote_files, events)
     }
 
     fn utf16le(text: &str) -> Vec<u8> {
@@ -675,6 +736,8 @@ mod tests {
             files,
             file_worker: Some(worker),
             remote_files: None,
+            #[cfg(feature = "client-to-server")]
+            mount: None,
         };
 
         backend.on_file_contents_request(FileContentsRequest {
@@ -731,9 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_file_reads_use_the_clipboard_callback_seam() {
-        let (mut backend, mut events) = backend_with_events();
-        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
-        backend.remote_files = Some(remote_files.clone());
+        let (mut backend, remote_files, mut events) = backend_with_remote_files();
 
         let read = remote_files.read(0, 3, 5);
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(request))) =
@@ -755,13 +816,25 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_owner_change_cancels_pending_remote_file_reads() {
-        let (mut backend, mut events) = backend_with_events();
-        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
-        backend.remote_files = Some(remote_files.clone());
+        let (mut backend, remote_files, mut events) = backend_with_remote_files();
 
         let read = remote_files.read(0, 0, 1);
         let _ = events.recv().await.expect("remote file request");
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+
+        assert!(read.await.unwrap().is_err());
+    }
+
+    /// A session that ends with reads still in flight must fail them now: the
+    /// connection they are waiting on is gone, and the process reading the
+    /// mount would otherwise sit in the kernel until the read timeout.
+    #[tokio::test]
+    async fn session_end_cancels_pending_remote_file_reads() {
+        let (backend, remote_files, mut events) = backend_with_remote_files();
+
+        let read = remote_files.read(0, 0, 1);
+        let _ = events.recv().await.expect("remote file request");
+        drop(backend);
 
         assert!(read.await.unwrap().is_err());
     }
@@ -776,9 +849,7 @@ mod tests {
         use super::super::remote_tree::{RemoteNodeKind, ROOT_INODE};
         use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileDescriptor};
 
-        let (mut backend, mut events) = backend_with_events();
-        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
-        backend.remote_files = Some(remote_files.clone());
+        let (mut backend, remote_files, mut events) = backend_with_remote_files();
 
         let advertised = remote_files.accept(&[
             FileDescriptor::new("project").with_attributes(ClipboardFileAttributes::DIRECTORY),

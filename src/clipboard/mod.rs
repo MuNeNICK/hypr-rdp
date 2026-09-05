@@ -9,9 +9,19 @@
 mod backend;
 mod files;
 mod formats;
+#[cfg(feature = "client-to-server")]
+mod mount;
 mod remote;
 #[cfg(feature = "client-to-server")]
 mod remote_tree;
 mod wayland;
 
 pub use backend::HyprCliprdrFactory;
+
+/// Removes remote-file mounts left behind by a server that exited without
+/// unmounting. Called once at start; a no-op where the direction that mounts
+/// is not compiled in.
+pub fn sweep_orphan_mounts() {
+    #[cfg(feature = "client-to-server")]
+    mount::sweep_orphan_mounts();
+}

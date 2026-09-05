@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 #[cfg(feature = "client-to-server")]
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use ironrdp_server::ServerEvent;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(feature = "client-to-server")]
 use super::formats::PendingWrite;
 #[cfg(feature = "client-to-server")]
 use super::remote_tree::{RemoteNode, RemoteNodeKind, RemoteTree};
@@ -26,8 +27,6 @@ pub(super) struct RemoteFiles {
     runtime: Handle,
     #[cfg(feature = "client-to-server")]
     max_entries: usize,
-    #[cfg(feature = "client-to-server")]
-    mount: Arc<Mutex<Option<MountedRemoteFiles>>>,
 }
 
 struct RemoteState {
@@ -44,12 +43,10 @@ struct RemoteState {
 struct PendingRead {
     answer: oneshot::Sender<Result<Vec<u8>, ()>>,
     fetch: ChunkedFetch,
-}
-
-#[cfg(feature = "client-to-server")]
-struct MountedRemoteFiles {
-    _session: fuser::BackgroundSession,
-    path: PathBuf,
+    /// Dropped with the read it belongs to, which ends that read's timeout.
+    /// Without it a session that transfers a large file accumulates one
+    /// sleeping task per range read for the length of the timeout.
+    _timeout: oneshot::Sender<()>,
 }
 
 impl RemoteFiles {
@@ -71,16 +68,13 @@ impl RemoteFiles {
             runtime: Handle::current(),
             #[cfg(feature = "client-to-server")]
             max_entries,
-            #[cfg(feature = "client-to-server")]
-            mount: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Records the client's list and returns the entries the Wayland side
     /// advertises as URIs, which are the ones the user selected.
     ///
-    /// Split from [`RemoteFiles::advertise`] so the inbound tree can be driven
-    /// without a mount.
+    /// Split from mounting so the inbound tree can be driven without a mount.
     #[cfg(feature = "client-to-server")]
     pub(super) fn accept(&self, files: &[FileDescriptor]) -> Vec<String> {
         let Ok(mut state) = self.inner.lock() else {
@@ -96,38 +90,14 @@ impl RemoteFiles {
             .collect()
     }
 
+    /// The filesystem view of this session's remote files, for the mount to
+    /// serve. Holding it keeps the state alive but not the mount, so the mount
+    /// is free to be dropped by whoever owns the session.
     #[cfg(feature = "client-to-server")]
-    pub(super) fn advertise(&self, files: &[FileDescriptor]) -> Option<PendingWrite> {
-        let roots = self.accept(files);
-        if roots.is_empty() {
-            tracing::warn!("Clipboard: the client's file list held nothing that can be pasted");
-            return None;
+    pub(super) fn filesystem(&self) -> impl fuser::Filesystem + 'static {
+        RemoteFilesystem {
+            files: self.clone(),
         }
-
-        let path = self.mount()?;
-        // Only the selected entries are advertised; a file manager walks into
-        // whichever of them are directories through the mount itself.
-        let uris: Vec<String> = roots
-            .iter()
-            .filter_map(|name| Some(url::Url::from_file_path(path.join(name)).ok()?.to_string()))
-            .collect();
-        if uris.is_empty() {
-            return None;
-        }
-        Some(PendingWrite::Files {
-            uri_list: uris
-                .iter()
-                .map(|uri| format!("{uri}\r\n"))
-                .collect::<String>()
-                .into_bytes(),
-            gnome_copied_files: format!("copy\n{}", uris.join("\n")).into_bytes(),
-        })
-    }
-
-    #[cfg(not(feature = "client-to-server"))]
-    pub(super) fn advertise(&self, _files: &[FileDescriptor]) -> Option<PendingWrite> {
-        tracing::warn!("Clipboard: client-to-server file transfer is not compiled in");
-        None
     }
 
     /// Begins one ranged read. This is the backend seam shared by FUSE and tests.
@@ -138,7 +108,7 @@ impl RemoteFiles {
         requested_size: u32,
     ) -> oneshot::Receiver<Result<Vec<u8>, ()>> {
         let (answer, receiver) = oneshot::channel();
-        let (stream_id, request) = {
+        let (stream_id, request, cancelled) = {
             let mut state = match self.inner.lock() {
                 Ok(state) => state,
                 Err(_) => return receiver,
@@ -165,10 +135,16 @@ impl RemoteFiles {
             );
             let mut request = fetch.next_request().expect("non-empty remote range");
             request.position = position;
-            state
-                .pending
-                .insert(stream_id, PendingRead { answer, fetch });
-            (stream_id, request)
+            let (timeout, cancelled) = oneshot::channel();
+            state.pending.insert(
+                stream_id,
+                PendingRead {
+                    answer,
+                    fetch,
+                    _timeout: timeout,
+                },
+            );
+            (stream_id, request, cancelled)
         };
         let sender = self.event_sender.clone();
         let state = Arc::clone(&self.inner);
@@ -182,8 +158,12 @@ impl RemoteFiles {
                 respond(&state, stream_id, Err(()));
                 return;
             }
-            tokio::time::sleep(READ_TIMEOUT).await;
-            respond(&state, stream_id, Err(()));
+            // Answering the read drops its end of this channel, which is what
+            // ends the timeout early rather than leaving it asleep.
+            tokio::select! {
+                _ = cancelled => {}
+                _ = tokio::time::sleep(READ_TIMEOUT) => respond(&state, stream_id, Err(())),
+            }
         });
         receiver
     }
@@ -204,6 +184,8 @@ impl RemoteFiles {
         let _ = pending.answer.send(result);
     }
 
+    /// Fails every read still waiting on the client, without waiting out its
+    /// timeout. The reading process sees an ordinary I/O error.
     pub(super) fn cancel_pending(&self) {
         let pending = self
             .inner
@@ -258,40 +240,28 @@ impl RemoteFiles {
         self.with_tree(|tree| tree.node(inode.0).map(|node| node.kind))
             .flatten()
     }
+}
 
-    #[cfg(feature = "client-to-server")]
-    fn mount(&self) -> Option<PathBuf> {
-        if let Some(mount) = self.mount.lock().ok()?.as_ref() {
-            return Some(mount.path.clone());
-        }
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-        let path =
-            PathBuf::from(runtime_dir).join(format!("hypr-rdp-clipboard-{}", std::process::id()));
-        std::fs::create_dir_all(&path).ok()?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
-        let filesystem = RemoteFilesystem {
-            files: self.clone(),
-        };
-        let mut config = fuser::Config::default();
-        config.mount_options = vec![
-            fuser::MountOption::RO,
-            fuser::MountOption::FSName("hypr-rdp-clipboard".into()),
-        ];
-        match fuser::spawn_mount(filesystem, &path, &config) {
-            Ok(session) => {
-                *self.mount.lock().ok()? = Some(MountedRemoteFiles {
-                    _session: session,
-                    path: path.clone(),
-                });
-                Some(path)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "Clipboard: cannot mount remote files");
-                None
-            }
-        }
+/// The Wayland payload offering `roots` — the entries the user selected — as
+/// URIs under the mount. A file manager walks into whichever of them are
+/// directories through the mount itself, so nothing below a root is listed here.
+#[cfg(feature = "client-to-server")]
+pub(super) fn uri_payload(mount: &Path, roots: &[String]) -> Option<PendingWrite> {
+    let uris: Vec<String> = roots
+        .iter()
+        .filter_map(|name| Some(url::Url::from_file_path(mount.join(name)).ok()?.to_string()))
+        .collect();
+    if uris.is_empty() {
+        return None;
     }
+    Some(PendingWrite::Files {
+        uri_list: uris
+            .iter()
+            .map(|uri| format!("{uri}\r\n"))
+            .collect::<String>()
+            .into_bytes(),
+        gnome_copied_files: format!("copy\n{}", uris.join("\n")).into_bytes(),
+    })
 }
 
 fn respond(state: &Arc<Mutex<RemoteState>>, stream_id: u32, result: Result<Vec<u8>, ()>) {
