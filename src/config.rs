@@ -28,7 +28,7 @@ impl FileTransferMode {
     }
 
     /// Always false on a build without the client-to-server direction compiled
-    /// in, whatever the configuration asked for. [`supported_file_transfer_mode`]
+    /// in, whatever the configuration asked for. [`resolve_file_transfer_mode`]
     /// already degrades such a configuration at startup; this keeps the answer
     /// honest for anything that builds a mode without going through it.
     pub(crate) fn permits_to_server(self) -> bool {
@@ -36,44 +36,42 @@ impl FileTransferMode {
     }
 }
 
-/// The mode this build can actually serve.
+fn default_file_transfer_mode_name() -> String {
+    "both".into()
+}
+
+/// The mode this build can actually serve, and the warning the operator is owed
+/// for the gap between that and what they asked for.
 ///
 /// The client-to-server direction is an optional build feature, because the
 /// userspace filesystem it mounts through is unavailable on some systems. A
-/// configuration asking for it on a build without it warns and degrades to the
-/// direction that does work, rather than refusing to start: a stale config
-/// file, or a NixOS release that turned the mount helper off, must not cost the
-/// operator their whole server.
+/// configuration asking for it on a build without it degrades to the direction
+/// that does work, rather than refusing to start: a stale config file, or a
+/// NixOS release that turned the mount helper off, must not cost the operator
+/// their whole server.
 ///
-/// `asked_for` says whether the operator actually named the mode, on the
-/// command line or in the config file. The default is `both`, so a build
-/// without the feature degrades on every start; warning about that would be
-/// noise on a binary its packager built exactly as intended. The warning is
-/// for the operator who asked for something this build cannot give them.
-fn supported_file_transfer_mode(mode: FileTransferMode, asked_for: bool) -> FileTransferMode {
-    let (supported, warning) = resolve_file_transfer_mode(mode, asked_for);
-    if let Some(warning) = warning {
-        tracing::warn!("{warning}");
-    }
-    supported
-}
-
-/// The decision [`supported_file_transfer_mode`] makes, separated from the
-/// logging so that both halves — what the server ends up serving, and whether
-/// the operator hears about it — can be asserted on.
+/// The warning is owed only when the operator named the mode themselves. The
+/// default is `both`, so a build without the feature degrades on every start,
+/// and saying so would be noise on a binary its packager built exactly as
+/// intended.
 fn resolve_file_transfer_mode(
-    mode: FileTransferMode,
-    asked_for: bool,
-) -> (FileTransferMode, Option<&'static str>) {
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<(FileTransferMode, Option<StartupWarning>)> {
+    let asked_for = cli_value.as_ref().or(config_value.as_ref()).cloned();
+    let mode = parse_file_transfer_mode(
+        &asked_for
+            .clone()
+            .unwrap_or_else(default_file_transfer_mode_name),
+    )?;
+
     if cfg!(feature = "client-to-server")
         || !matches!(mode, FileTransferMode::ToServer | FileTransferMode::Both)
     {
-        return (mode, None);
+        return Ok((mode, None));
     }
-    let warning = asked_for.then_some(
-        "File transfer to the server is not compiled into this build; continuing with 'to-client'",
-    );
-    (FileTransferMode::ToClient, warning)
+    let warning = asked_for.map(StartupWarning::FileTransferToServerUnavailable);
+    Ok((FileTransferMode::ToClient, warning))
 }
 
 #[derive(Parser, Debug)]
@@ -298,6 +296,8 @@ enum StartupWarning {
     AuthenticationOff,
     ReachableBeyondLoopback,
     HalfCredentials,
+    /// Carries the mode the operator asked for, so the log line can name it.
+    FileTransferToServerUnavailable(String),
 }
 
 fn startup_warnings(
@@ -337,8 +337,13 @@ impl RuntimeConfig {
         let username = args.username.or(config.username).unwrap_or_default();
         let password = args.password.or(config.password).unwrap_or_default();
         let credentials = ConfigCredentials::from_parts(username, password);
+        let (file_transfer_mode, file_transfer_warning) =
+            resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
 
-        for warning in startup_warnings(credentials.as_ref(), bind) {
+        for warning in startup_warnings(credentials.as_ref(), bind)
+            .into_iter()
+            .chain(file_transfer_warning)
+        {
             match warning {
                 StartupWarning::AuthenticationOff => tracing::warn!(
                     "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
@@ -349,6 +354,10 @@ impl RuntimeConfig {
                 ),
                 StartupWarning::HalfCredentials => tracing::warn!(
                     "Only one half of the credentials is set; the other one is matched as empty."
+                ),
+                StartupWarning::FileTransferToServerUnavailable(asked_for) => tracing::warn!(
+                    asked_for,
+                    "File transfer to the server is not compiled into this build; continuing with 'to-client'."
                 ),
             }
         }
@@ -385,11 +394,6 @@ impl RuntimeConfig {
         let output = args.output.or(config.output);
         let on_session_start = args.on_session_start.or(config.on_session_start);
         let on_session_end = args.on_session_end.or(config.on_session_end);
-        let requested_file_transfer_mode = args.file_transfer_mode.or(config.file_transfer_mode);
-        let file_transfer_mode = supported_file_transfer_mode(
-            parse_file_transfer_mode(requested_file_transfer_mode.as_deref().unwrap_or("both"))?,
-            requested_file_transfer_mode.is_some(),
-        );
         let file_transfer_max_chunk_bytes = args
             .file_transfer_max_chunk_bytes
             .or(config.file_transfer_max_chunk_bytes)
@@ -721,64 +725,78 @@ mod tests {
         assert!(parse_file_transfer_mode("invalid").is_err());
     }
 
-    /// A stale config asking for a direction this build cannot serve must not
-    /// stop the server from starting; it degrades to the direction that works.
+    /// Modes that never involve the optional direction are untouched whatever
+    /// this build can serve, so this holds either way.
     #[test]
-    fn a_build_without_the_client_to_server_direction_degrades_instead_of_failing() {
-        assert_eq!(
-            supported_file_transfer_mode(FileTransferMode::Off, true),
-            FileTransferMode::Off
-        );
-        assert_eq!(
-            supported_file_transfer_mode(FileTransferMode::ToClient, true),
-            FileTransferMode::ToClient
-        );
+    fn a_mode_that_does_not_involve_the_optional_direction_is_never_degraded() {
+        for (asked_for, expected) in [
+            ("off", FileTransferMode::Off),
+            ("to-client", FileTransferMode::ToClient),
+        ] {
+            let (mode, warning) = resolve_file_transfer_mode(Some(asked_for.into()), None).unwrap();
 
-        let expected = if cfg!(feature = "client-to-server") {
-            [FileTransferMode::ToServer, FileTransferMode::Both]
-        } else {
-            [FileTransferMode::ToClient, FileTransferMode::ToClient]
-        };
-        assert_eq!(
-            supported_file_transfer_mode(FileTransferMode::ToServer, true),
-            expected[0]
-        );
-        assert_eq!(
-            supported_file_transfer_mode(FileTransferMode::Both, true),
-            expected[1]
-        );
+            assert_eq!(mode, expected);
+            assert_eq!(warning, None);
+        }
     }
 
-    /// The default is `both`, so a build without the direction degrades on
-    /// every start. Degrading is right; warning about it is not, on a binary
-    /// whose operator never asked for the direction in the first place.
+    /// The command line beats the config file, as it does for every other option.
     #[test]
-    fn a_default_mode_degrades_on_such_a_build_without_warning_about_it() {
-        let (mode, warning) = resolve_file_transfer_mode(FileTransferMode::Both, false);
+    fn a_mode_on_the_command_line_overrides_the_config_file() {
+        let (mode, _) =
+            resolve_file_transfer_mode(Some("off".into()), Some("both".into())).unwrap();
 
-        assert_eq!(
-            mode,
-            if cfg!(feature = "client-to-server") {
-                FileTransferMode::Both
-            } else {
-                FileTransferMode::ToClient
-            }
-        );
+        assert_eq!(mode, FileTransferMode::Off);
+    }
+
+    /// A stale config asking for a direction this build cannot serve must not
+    /// stop the server from starting; it degrades to the direction that works,
+    /// and says so, because the operator named it.
+    #[cfg(not(feature = "client-to-server"))]
+    #[test]
+    fn a_mode_the_operator_asked_for_degrades_and_warns_without_the_direction() {
+        for asked_for in ["to-server", "both"] {
+            let (mode, warning) = resolve_file_transfer_mode(Some(asked_for.into()), None).unwrap();
+
+            assert_eq!(mode, FileTransferMode::ToClient);
+            assert_eq!(
+                warning,
+                Some(StartupWarning::FileTransferToServerUnavailable(
+                    asked_for.into()
+                ))
+            );
+        }
+    }
+
+    /// The default is `both`, so such a build degrades on every start.
+    /// Degrading is right; warning about it is not, on a binary whose operator
+    /// never asked for the direction in the first place.
+    #[cfg(not(feature = "client-to-server"))]
+    #[test]
+    fn an_untouched_default_degrades_on_such_a_build_without_warning_about_it() {
+        let (mode, warning) = resolve_file_transfer_mode(None, None).unwrap();
+
+        assert_eq!(mode, FileTransferMode::ToClient);
         assert_eq!(warning, None, "an untouched default is not worth a warning");
     }
 
-    /// An operator who did name the direction hears why they are not getting
-    /// it — that is the whole point of degrading rather than failing.
+    /// With the direction compiled in there is nothing to degrade and nothing
+    /// to warn about, whatever was asked for.
+    #[cfg(feature = "client-to-server")]
     #[test]
-    fn a_mode_the_operator_asked_for_warns_when_this_build_cannot_serve_it() {
-        let (mode, warning) = resolve_file_transfer_mode(FileTransferMode::ToServer, true);
+    fn every_mode_is_served_as_asked_when_the_direction_is_compiled_in() {
+        for (asked_for, expected) in [
+            (None, FileTransferMode::Both),
+            (Some("off"), FileTransferMode::Off),
+            (Some("to-client"), FileTransferMode::ToClient),
+            (Some("to-server"), FileTransferMode::ToServer),
+            (Some("both"), FileTransferMode::Both),
+        ] {
+            let (mode, warning) =
+                resolve_file_transfer_mode(asked_for.map(Into::into), None).unwrap();
 
-        if cfg!(feature = "client-to-server") {
-            assert_eq!(mode, FileTransferMode::ToServer);
+            assert_eq!(mode, expected);
             assert_eq!(warning, None);
-        } else {
-            assert_eq!(mode, FileTransferMode::ToClient);
-            assert!(warning.is_some(), "the operator is told why");
         }
     }
 

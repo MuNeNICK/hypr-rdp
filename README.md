@@ -65,8 +65,8 @@ Requirements:
 - Rust 1.75+
 - `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon` (development headers)
 
-Pasting files from the client is the default-on `client-to-server` feature and needs FUSE
-at runtime, not at build time. See "Pasting from the client".
+The default-on `client-to-server` feature adds no build-time dependency — its FUSE
+requirement is a runtime one. See "Pasting from the client".
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
@@ -175,19 +175,22 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 
 ### File transfer
 
-Select files or folders in any Hyprland file manager, press Ctrl+C, and paste them into
-the RDP client's file manager. Transfers ride the clipboard channel the session already
-negotiates — there is nothing extra to launch and no port to open. The feature is on by
-default.
+Files move both ways over the clipboard channel the session already negotiates — there is
+nothing extra to launch and no port to open. Select files or folders in any Hyprland file
+manager, press Ctrl+C, and paste them into the RDP client's file manager; copy files on
+the client and paste them onto the Hyprland desktop. Both directions are on by default.
+
+**A cut is always a copy.** Ctrl+X and Ctrl+C behave identically, in both directions: the
+files arrive on the other side and the originals stay exactly where they were. hypr-rdp
+never deletes a source file and never asks the client to, so a transfer that half-succeeds
+can never lose your only copy.
+
+#### Copying to the client
 
 Copying a folder copies its whole tree, empty subdirectories included. Symbolic links are
 followed and arrive as the file they point at. Sockets, FIFOs and device nodes are skipped
 and logged rather than transferred. A directory tree containing a symlink cycle is
 detected and terminates rather than looping.
-
-**A cut is always a copy.** Ctrl+X and Ctrl+C behave identically: the file arrives on the
-client and the original stays exactly where it was. hypr-rdp never deletes a source file,
-in either direction, so a transfer that half-succeeds can never lose your only copy.
 
 Filenames are adjusted so they land on a client filesystem that accepts fewer names than
 Linux does. Characters Windows forbids (`< > : " / \ | ? *` and C0 control characters)
@@ -205,19 +208,6 @@ Enumeration and reads run on a worker thread, so copying a large tree does not s
 video, audio or input. Files are read in ranges on demand and never buffered whole, so a
 multi-gigabyte file does not grow the server's memory.
 
-| Key | Values | Default | Meaning |
-|------|-------------|---------|---------|
-| `file_transfer_mode` | `off`, `to-client`, `to-server`, `both` | `both` | Which directions are permitted: `to-client` is desktop to client, `to-server` is client to desktop. Text and image clipboard sync are unaffected by every value |
-| `file_transfer_max_entries` | 1 to 100000 | `10000` | How many files and directories one copy may enumerate. A selection over the limit is truncated and logged rather than failing. 100000 is the clipboard protocol's own ceiling and is rejected if exceeded |
-| `file_transfer_max_chunk_bytes` | bytes | `8388608` | Largest read a single client request may ask for. This is the bound on how much memory one request can make the server allocate; a request above it is refused |
-
-Every key is also a command-line flag (`--file-transfer-mode` and so on).
-
-A mode that excludes `to-client` stops files being transferred, but a file copied in a
-Hyprland file manager still reaches the client's clipboard as **text**: the selection's
-`file://` URI list is published as ordinary text when it cannot be offered as files. Paths
-leave the machine in that case even though contents do not.
-
 Paths are only ever taken from a selection the desktop user themselves put on the
 clipboard — never from anything the client sends — and a file swapped out between the copy
 and the paste is detected and refused rather than served under the old name.
@@ -226,7 +216,28 @@ and the paste is detected and refused rather than served under the old name.
 
 Files copied on the client paste onto the Hyprland desktop through a read-only FUSE mount
 of the client's selection, so the paste completes at once and the bytes stream as the file
-is read rather than downloading first.
+is read rather than downloading first. Your file manager copies out of that mount the way
+it copies out of any other directory.
+
+The selection is offered to Wayland as both `text/uri-list` and
+`x-special/gnome-copied-files`, so GNOME-derived file managers (Nautilus, Nemo, Caja) and
+non-GNOME ones (Dolphin, Thunar, PCManFM) all see it. Names arrive as the client sent them
+and are not adjusted; entries the client names with `.`, `..`, an embedded NUL, or a path
+deeper than the outbound walk would go are dropped and logged.
+
+Because the bytes come from the client on demand, **the mount only works while the session
+is connected**. A copy still running when the session ends, or when the client stops
+answering, fails with an ordinary I/O error rather than hanging:
+
+- Each range read waits at most 30 seconds for the client before failing that read.
+- Every read still waiting is failed at once — without waiting out that 30 seconds — when
+  the session ends or the client's clipboard changes owner.
+- The mount is unmounted and its directory removed when the session ends. One left behind
+  by a server that was killed is swept away the next time hypr-rdp starts, so a bad exit
+  does not leave a broken directory in your runtime directory.
+
+The mount is read-only. You paste *out* of it; nothing can be written into it, and it is
+not a way to put files onto the client.
 
 This direction is the `client-to-server` build feature, **enabled by default**. It is
 optional because it needs FUSE at runtime, which not every machine offers:
@@ -235,8 +246,9 @@ optional because it needs FUSE at runtime, which not every machine offers:
   depend on.
 - On NixOS, that helper is a setuid wrapper at `/run/wrappers/bin/fusermount3`, built only
   when **`programs.fuse.enable = true;`** is set. That option is on by default on NixOS
-  25.11 but off on `nixos-unstable`, so an upgrade can take the helper away. Set
-  `FUSERMOUNT_PATH` to point at the helper anywhere else it lives.
+  25.11 but off on `nixos-unstable`, so an upgrade can take the helper away. The Nix
+  package points `FUSERMOUNT_PATH` at that wrapper; set it yourself to reach the helper
+  anywhere else it lives.
 - Nothing in `/etc/fuse.conf` needs changing, and `allow_other` is never used: the mount is
   private to the user running hypr-rdp, under a mode-0700 directory in `XDG_RUNTIME_DIR`.
 
@@ -248,10 +260,26 @@ cargo build --release --no-default-features --features vaapi
 ```
 
 Neither absence stops the server. A `file_transfer_mode` of `to-server` or `both` on a
-build without the feature warns and continues as `to-client`, so a stale config file never
-costs you a session. A mount that cannot be created at runtime — no kernel module, no
-helper, no usable runtime directory — is warned about and the paste is skipped; the
-session, the other direction, and text and image clipboard sync all keep working.
+build without the feature continues as `to-client` — warning if you asked for it by name —
+so a stale config file never costs you a session. A mount that cannot be created at
+runtime — no kernel module, no helper, no usable runtime directory — is warned about and
+the paste is skipped; the session, the other direction, and text and image clipboard sync
+all keep working.
+
+#### Settings
+
+| Key | Values | Default | Meaning |
+|------|-------------|---------|---------|
+| `file_transfer_mode` | `off`, `to-client`, `to-server`, `both` | `both` | Which directions are permitted: `to-client` is desktop to client, `to-server` is client to desktop. Text and image clipboard sync are unaffected by every value |
+| `file_transfer_max_entries` | 1 to 100000 | `10000` | How many files and directories one selection may hold, in **both** directions: what a Hyprland copy enumerates, and what a client's file list may describe. Over the limit is truncated and logged rather than failing. 100000 is the clipboard protocol's own ceiling and is rejected if exceeded |
+| `file_transfer_max_chunk_bytes` | bytes | `8388608` | Largest read a single client request may ask of the desktop. This is the bound on how much memory one request can make the server allocate; a request above it is refused. It does not apply to the other direction, where the kernel sizes the reads |
+
+Every key is also a command-line flag (`--file-transfer-mode` and so on).
+
+A mode that excludes `to-client` stops files being transferred to the client, but a file
+copied in a Hyprland file manager still reaches the client's clipboard as **text**: the
+selection's `file://` URI list is published as ordinary text when it cannot be offered as
+files. Paths leave the machine in that case even though contents do not.
 
 ### Options
 
@@ -278,8 +306,8 @@ session, the other direction, and text and image clipboard sync all keep working
 | `--on-session-start` | Shell command run when an authenticated session starts | _(none)_ |
 | `--on-session-end` | Shell command run when the session ends | _(none)_ |
 | `--file-transfer-mode` | Clipboard file transfer policy: `off`, `to-client`, `to-server`, or `both`. See "File transfer" | `both` |
-| `--file-transfer-max-entries` | Maximum files and directories enumerated from one clipboard selection, at most `100000` | `10000` |
-| `--file-transfer-max-chunk-bytes` | Maximum bytes accepted in one clipboard file-content range request | `8388608` |
+| `--file-transfer-max-entries` | Maximum files and directories in one clipboard selection, in either direction, at most `100000` | `10000` |
+| `--file-transfer-max-chunk-bytes` | Maximum bytes the client may ask for in one file-content range request | `8388608` |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 
 ## License

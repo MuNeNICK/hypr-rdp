@@ -280,8 +280,10 @@ fn unmount(path: &Path) {
     tracing::warn!(path = %path.display(), "Clipboard: no mount helper could unmount an orphan");
 }
 
-/// Mirrors how the filesystem crate finds the mount helper, including the
-/// environment override NixOS needs to reach its setuid wrapper.
+/// Where to look for a mount helper, most specific first: the environment
+/// override both this module and the filesystem crate honour, then the names
+/// and paths the crate itself searches, then the NixOS wrapper directory the
+/// crate does not know about but a self-built binary still has to reach.
 fn unmount_programs() -> Vec<String> {
     let mut programs = Vec::new();
     if let Some(configured) = std::env::var_os("FUSERMOUNT_PATH") {

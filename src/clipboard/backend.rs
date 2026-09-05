@@ -896,19 +896,21 @@ mod tests {
         assert_eq!(read.await.unwrap().unwrap(), b"crate");
     }
 
-    /// A paste the server cannot give the desktop anywhere to read from — no
-    /// mount, because the kernel, the mount helper or the runtime directory
-    /// will not have one — costs the paste and nothing else. The backend
-    /// leaves the clipboard as it was and goes on serving; ending the session
-    /// over it would take the user's whole desktop with it.
+    /// A paste the server cannot give the desktop anywhere to read from costs
+    /// the paste and nothing else: the backend leaves the clipboard as it was
+    /// and goes on serving, where ending the session over it would take the
+    /// user's whole desktop with it.
+    ///
+    /// This drives the arm where there is nothing to advertise *through*. The
+    /// sibling arm — a mount that cannot be created — reaches the same
+    /// handling by a different route, and is verified by hand rather than
+    /// here; see row 48 of the acceptance matrix.
     #[cfg(feature = "client-to-server")]
     #[test]
     fn a_paste_with_nowhere_to_land_leaves_the_session_serving() {
         use ironrdp_cliprdr::pdu::FileDescriptor;
 
         let (mut backend, mut events) = backend_with_events();
-        // Nothing to advertise the client's files through, which is the same
-        // `None` a mount that cannot be created hands the same join point.
         assert!(backend.remote_files.is_none());
 
         backend.on_remote_file_list(&[FileDescriptor::new("report.pdf").with_file_size(3)], None);
