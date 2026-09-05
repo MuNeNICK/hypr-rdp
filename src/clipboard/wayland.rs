@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
+use super::files::{uri_list_paths, FileWorkerCommand, FrozenFiles};
 use super::formats::{
     PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
     UTF8_MIME,
@@ -34,6 +36,9 @@ pub(super) fn clipboard_thread(
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     running: Arc<AtomicBool>,
+    files: FrozenFiles,
+    file_worker_sender: Option<Sender<FileWorkerCommand>>,
+    file_transfer_enabled: bool,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("clipboard: failed to connect to Wayland: {}", e))?;
@@ -49,6 +54,9 @@ pub(super) fn clipboard_thread(
         clipboard_image,
         pending_write,
         echo_candidate,
+        files,
+        file_worker_sender,
+        file_transfer_enabled,
     );
 
     let wayland_fd = conn.as_fd().as_raw_fd();
@@ -160,6 +168,9 @@ struct ClipState {
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    files: FrozenFiles,
+    file_worker_sender: Option<Sender<FileWorkerCommand>>,
+    file_transfer_enabled: bool,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -181,6 +192,9 @@ impl ClipState {
         clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
         pending_write: Arc<Mutex<Option<PendingWrite>>>,
         echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+        files: FrozenFiles,
+        file_worker_sender: Option<Sender<FileWorkerCommand>>,
+        file_transfer_enabled: bool,
     ) -> Self {
         Self {
             event_sender,
@@ -189,6 +203,9 @@ impl ClipState {
             clipboard_image,
             pending_write,
             echo_candidate,
+            files,
+            file_worker_sender,
+            file_transfer_enabled,
             manager: None,
             seat: None,
             device: None,
@@ -329,6 +346,9 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                         if let Ok(mut g) = state.clipboard_image.lock() {
                             *g = None;
                         }
+                        if let Ok(mut files) = state.files.lock() {
+                            *files = None;
+                        }
                         return;
                     }
                 };
@@ -347,10 +367,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 let image_mime = SelectionKind::Image.offered_wayland_mime(&mimes);
                 let files_mime = SelectionKind::Files.offered_wayland_mime(&mimes);
 
-                if text_mime.is_none() && image_mime.is_none() {
-                    if files_mime.is_some() {
-                        tracing::trace!("Clipboard: file selection support is not enabled yet");
-                    }
+                if text_mime.is_none() && image_mime.is_none() && files_mime.is_none() {
                     // No supported MIME — clear stale caches
                     if let Ok(mut g) = state.clipboard_data.lock() {
                         *g = None;
@@ -375,6 +392,12 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 if image_mime.is_none() {
                     if let Ok(mut g) = state.clipboard_image.lock() {
                         *g = None;
+                    }
+                }
+
+                if !state.file_transfer_enabled || files_mime.is_none() {
+                    if let Ok(mut files) = state.files.lock() {
+                        *files = None;
                     }
                 }
 
@@ -413,6 +436,30 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+
+                if let Some(ref mime) = files_mime {
+                    if let Some(uri_list) = read_offer_data(&offer, mime, conn) {
+                        let paths = uri_list_paths(&uri_list);
+                        if let Ok(mut files) = state.files.lock() {
+                            *files = None;
+                        }
+                        if state.file_transfer_enabled && !paths.is_empty() {
+                            if let Some(worker) = &state.file_worker_sender {
+                                // This tracer intentionally freezes one regular file. Folder
+                                // traversal and multiple selections arrive in the next slice.
+                                let _ = worker.send(FileWorkerCommand::Freeze(
+                                    paths.into_iter().take(1).collect(),
+                                ));
+                            }
+                        } else if text_mime.is_none() && !uri_list.is_empty() {
+                            // URI lists without file entries remain ordinary text clipboard data.
+                            if let Ok(mut data) = state.clipboard_data.lock() {
+                                *data = Some(uri_list);
+                            }
+                            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
                         }
                     }
                 }
@@ -757,6 +804,9 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            None,
+            true,
         )
     }
 

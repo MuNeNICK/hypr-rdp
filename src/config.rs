@@ -11,6 +11,20 @@ use crate::egfx::{
 };
 use crate::input::KeyboardLayoutPolicy;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileTransferMode {
+    Off,
+    ToClient,
+    ToServer,
+    Both,
+}
+
+impl FileTransferMode {
+    pub(crate) fn permits_to_client(self) -> bool {
+        matches!(self, Self::ToClient | Self::Both)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
 struct Args {
@@ -97,6 +111,14 @@ struct Args {
     #[arg(long)]
     on_session_end: Option<String>,
 
+    /// File transfer policy: "off", "to-client", "to-server", or "both"
+    #[arg(long)]
+    file_transfer_mode: Option<String>,
+
+    /// Maximum bytes accepted in one clipboard file-content range request
+    #[arg(long)]
+    file_transfer_max_chunk_bytes: Option<u32>,
+
     /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
     #[arg(long)]
     config: Option<String>,
@@ -124,6 +146,8 @@ struct ConfigFile {
     output: Option<String>,
     on_session_start: Option<String>,
     on_session_end: Option<String>,
+    file_transfer_mode: Option<String>,
+    file_transfer_max_chunk_bytes: Option<u32>,
 }
 
 impl ConfigFile {
@@ -192,6 +216,8 @@ pub struct RuntimeConfig {
     pub output: Option<String>,
     pub on_session_start: Option<String>,
     pub on_session_end: Option<String>,
+    pub file_transfer_mode: FileTransferMode,
+    pub file_transfer_max_chunk_bytes: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -302,6 +328,16 @@ impl RuntimeConfig {
         let output = args.output.or(config.output);
         let on_session_start = args.on_session_start.or(config.on_session_start);
         let on_session_end = args.on_session_end.or(config.on_session_end);
+        let file_transfer_mode = parse_file_transfer_mode(
+            &args
+                .file_transfer_mode
+                .or(config.file_transfer_mode)
+                .unwrap_or_else(|| "both".into()),
+        )?;
+        let file_transfer_max_chunk_bytes = args
+            .file_transfer_max_chunk_bytes
+            .or(config.file_transfer_max_chunk_bytes)
+            .unwrap_or(8 * 1024 * 1024);
 
         let resolution = parse_resolution(&resolution_str)?;
         let capture_mode = parse_capture_mode(&capture_mode_str)?;
@@ -314,6 +350,9 @@ impl RuntimeConfig {
         }
         if max_frames_in_flight == 0 {
             anyhow::bail!("max-frames-in-flight must be > 0");
+        }
+        if file_transfer_max_chunk_bytes == 0 {
+            anyhow::bail!("file-transfer-max-chunk-bytes must be > 0");
         }
 
         Ok(Self {
@@ -337,7 +376,21 @@ impl RuntimeConfig {
             output,
             on_session_start,
             on_session_end,
+            file_transfer_mode,
+            file_transfer_max_chunk_bytes,
         })
+    }
+}
+
+fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
+    match value {
+        "off" => Ok(FileTransferMode::Off),
+        "to-client" => Ok(FileTransferMode::ToClient),
+        "to-server" => Ok(FileTransferMode::ToServer),
+        "both" => Ok(FileTransferMode::Both),
+        other => anyhow::bail!(
+            "unknown file transfer mode '{other}', expected 'off', 'to-client', 'to-server', or 'both'"
+        ),
     }
 }
 
@@ -583,6 +636,15 @@ mod tests {
     fn invalid_bind_address_is_rejected_by_config() {
         let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
         assert!(format!("{error:#}").contains("invalid bind address"));
+    }
+
+    #[test]
+    fn file_transfer_mode_accepts_all_documented_values() {
+        assert!(FileTransferMode::Both.permits_to_client());
+        assert!(FileTransferMode::ToClient.permits_to_client());
+        assert!(!FileTransferMode::Off.permits_to_client());
+        assert!(!FileTransferMode::ToServer.permits_to_client());
+        assert!(parse_file_transfer_mode("invalid").is_err());
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

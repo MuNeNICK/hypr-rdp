@@ -7,6 +7,7 @@
 //! Supports text (CF_UNICODETEXT) and images (CF_DIB via PNG conversion).
 
 mod backend;
+mod files;
 mod formats;
 mod wayland;
 
