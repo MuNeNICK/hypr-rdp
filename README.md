@@ -8,6 +8,8 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 - **Screen capture** — `wlr-screencopy-v1` and `ext-image-copy-capture-v1` protocols
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync
+- **File transfer** — Copy files and folders in a Hyprland file manager and paste them into
+  the client's, over the clipboard channel. See "File transfer"
 - **Input** — Full keyboard and mouse support via virtual keyboard/pointer protocols
 - **Session hooks** — Run a command when a client session starts and ends
 - **TLS** — Auto-generated self-signed RSA-2048 certificates, or bring your own. Existing
@@ -120,6 +122,9 @@ egfx_codec = "avc420"
 # output = "DP-1"
 # on_session_start = "hyprctl dispatch dpms off eDP-1"  # see "Session hooks"
 # on_session_end = "hyprctl dispatch dpms on eDP-1"
+# file_transfer_mode = "both"              # see "File transfer"
+# file_transfer_max_entries = 10000
+# file_transfer_max_chunk_bytes = 8388608
 ```
 
 CLI arguments override config file values.
@@ -163,6 +168,55 @@ it is off the compositor stops committing frames, so the session freezes, and
 remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 `misc:key_press_enables_dpms` are disabled.
 
+### File transfer
+
+Select files or folders in any Hyprland file manager, press Ctrl+C, and paste them into
+the RDP client's file manager. Transfers ride the clipboard channel the session already
+negotiates — there is nothing extra to launch and no port to open. The feature is on by
+default.
+
+Copying a folder copies its whole tree, empty subdirectories included. Symbolic links are
+followed and arrive as the file they point at. Sockets, FIFOs and device nodes are skipped
+and logged rather than transferred. A directory tree containing a symlink cycle is
+detected and terminates rather than looping.
+
+**A cut is always a copy.** Ctrl+X and Ctrl+C behave identically: the file arrives on the
+client and the original stays exactly where it was. hypr-rdp never deletes a source file,
+in either direction, so a transfer that half-succeeds can never lose your only copy.
+
+Filenames are adjusted so they land on a client filesystem that accepts fewer names than
+Linux does. Characters Windows forbids (`< > : " / \ | ? *` and C0 control characters)
+become underscores, trailing dots and spaces are trimmed, reserved device names like `CON`
+and `LPT1` gain a trailing underscore, and names that are not valid UTF-8 are decoded
+lossily. Two names in the same directory that collide after adjustment are disambiguated —
+`a:b.txt` and `a?b.txt` become `a_b.txt` and `a_b (2).txt` — so neither silently overwrites
+the other. Names are compared case-insensitively, as Windows compares them, so `README.txt`
+alongside `readme.txt` is also disambiguated even though neither name needed adjusting. No
+single awkward name ever fails the rest of the paste. Because the RDP clipboard gives the
+server no way to learn the client's operating system, this adjustment is applied for every
+client.
+
+Enumeration and reads run on a worker thread, so copying a large tree does not stall
+video, audio or input. Files are read in ranges on demand and never buffered whole, so a
+multi-gigabyte file does not grow the server's memory.
+
+| Key | Values | Default | Meaning |
+|------|-------------|---------|---------|
+| `file_transfer_mode` | `off`, `to-client`, `to-server`, `both` | `both` | Which directions are permitted: `to-client` is desktop to client, `to-server` is client to desktop. Text and image clipboard sync are unaffected by every value |
+| `file_transfer_max_entries` | 1 to 100000 | `10000` | How many files and directories one copy may enumerate. A selection over the limit is truncated and logged rather than failing. 100000 is the clipboard protocol's own ceiling and is rejected if exceeded |
+| `file_transfer_max_chunk_bytes` | bytes | `8388608` | Largest read a single client request may ask for. This is the bound on how much memory one request can make the server allocate; a request above it is refused |
+
+Every key is also a command-line flag (`--file-transfer-mode` and so on).
+
+A mode that excludes `to-client` stops files being transferred, but a file copied in a
+Hyprland file manager still reaches the client's clipboard as **text**: the selection's
+`file://` URI list is published as ordinary text when it cannot be offered as files. Paths
+leave the machine in that case even though contents do not.
+
+Paths are only ever taken from a selection the desktop user themselves put on the
+clipboard — never from anything the client sends — and a file swapped out between the copy
+and the paste is detected and refused rather than served under the old name.
+
 ### Options
 
 | Flag | Description | Default |
@@ -187,6 +241,9 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | `--output` | Specific output name. Automatic sizing does not magnify the captured content; one presentation axis may remain larger for letterboxing. | _(headless)_ |
 | `--on-session-start` | Shell command run when an authenticated session starts | _(none)_ |
 | `--on-session-end` | Shell command run when the session ends | _(none)_ |
+| `--file-transfer-mode` | Clipboard file transfer policy: `off`, `to-client`, `to-server`, or `both`. See "File transfer" | `both` |
+| `--file-transfer-max-entries` | Maximum files and directories enumerated from one clipboard selection, at most `100000` | `10000` |
+| `--file-transfer-max-chunk-bytes` | Maximum bytes accepted in one clipboard file-content range request | `8388608` |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 
 ## License

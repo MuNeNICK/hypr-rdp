@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added clipboard file transfer from the Hyprland desktop to the RDP client, carrying whole directory trees over the clipboard channel.
+- Added `file_transfer_mode`, `file_transfer_max_entries`, and `file_transfer_max_chunk_bytes` settings, each also a command-line flag.
+- Added outbound filename adjustment so names illegal on the client's filesystem still arrive, with collisions disambiguated.
+
 ## [0.1.5] - 2026-08-19
 
 ### Fixed
@@ -74,6 +82,7 @@
 
 - Initial public release.
 
+[Unreleased]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.5...HEAD
 [0.1.5]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.2...v0.1.3
