@@ -26,6 +26,18 @@ impl FileTransferMode {
     pub(crate) fn permits_to_client(self) -> bool {
         matches!(self, Self::ToClient | Self::Both)
     }
+
+    pub(crate) fn permits_to_server(self) -> bool {
+        #[cfg(feature = "client-to-server")]
+        {
+            matches!(self, Self::ToServer | Self::Both)
+        }
+        #[cfg(not(feature = "client-to-server"))]
+        {
+            let _ = self;
+            false
+        }
+    }
 }
 
 #[derive(Parser, Debug)]

@@ -18,8 +18,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
-    PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
-    UTF8_MIME,
+    PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME,
+    MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
 };
 
 const DATA_CONTROL_VERSION: u32 = 1;
@@ -122,10 +122,15 @@ pub(super) fn clipboard_thread(
                     tracing::trace!(len = data.len(), "Clipboard: writing image to Wayland");
                     source.offer(IMAGE_PNG_MIME.to_string());
                 }
+                PendingWrite::Files { uri_list, .. } => {
+                    tracing::trace!(len = uri_list.len(), "Clipboard: writing files to Wayland");
+                    source.offer(FILE_URI_LIST_MIME.to_string());
+                    source.offer(GNOME_COPIED_FILES_MIME.to_string());
+                }
             }
             state.active_selection = Some(ActiveSelection {
                 kind: pending.kind(),
-                data: pending.data().to_vec(),
+                pending,
             });
 
             if let Some(dev) = state.device.as_ref() {
@@ -175,7 +180,7 @@ struct ClipState {
 
 struct ActiveSelection {
     kind: SelectionKind,
-    data: Vec<u8>,
+    pending: PendingWrite,
 }
 
 impl ClipState {
@@ -731,7 +736,9 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
 
                 if should_send {
                     if let Some(selection) = selection {
-                        write_source_data(&fd, &selection.data);
+                        if let Some(data) = selection.pending.data_for_mime(&mime_type) {
+                            write_source_data(&fd, data);
+                        }
                     }
                 }
             }

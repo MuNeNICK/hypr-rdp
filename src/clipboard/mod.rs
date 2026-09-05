@@ -9,6 +9,7 @@
 mod backend;
 mod files;
 mod formats;
+mod remote;
 mod wayland;
 
 pub use backend::HyprCliprdrFactory;

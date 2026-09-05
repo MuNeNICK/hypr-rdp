@@ -5,6 +5,7 @@ pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 pub(super) const FILE_URI_LIST_MIME: &str = "text/uri-list";
+pub(super) const GNOME_COPIED_FILES_MIME: &str = "x-special/gnome-copied-files";
 
 /// The kind of content carried by a clipboard selection.
 ///
@@ -28,7 +29,7 @@ impl SelectionKind {
         match self {
             Self::Text => mime == TEXT_MIME || mime == UTF8_MIME || mime == TEXT_PLAIN_MIME,
             Self::Image => mime == IMAGE_PNG_MIME,
-            Self::Files => mime == FILE_URI_LIST_MIME,
+            Self::Files => mime == FILE_URI_LIST_MIME || mime == GNOME_COPIED_FILES_MIME,
         }
     }
 
@@ -96,6 +97,10 @@ pub(super) fn to_crlf(text: &str) -> String {
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
     Image(Vec<u8>), // PNG bytes
+    Files {
+        uri_list: Vec<u8>,
+        gnome_copied_files: Vec<u8>,
+    },
 }
 
 impl PendingWrite {
@@ -103,12 +108,19 @@ impl PendingWrite {
         match self {
             Self::Text(_) => SelectionKind::Text,
             Self::Image(_) => SelectionKind::Image,
+            Self::Files { .. } => SelectionKind::Files,
         }
     }
 
-    pub(super) fn data(&self) -> &[u8] {
+    pub(super) fn data_for_mime(&self, mime: &str) -> Option<&[u8]> {
         match self {
-            Self::Text(data) | Self::Image(data) => data,
+            Self::Text(data) if SelectionKind::Text.accepts_wayland_mime(mime) => Some(data),
+            Self::Image(data) if SelectionKind::Image.accepts_wayland_mime(mime) => Some(data),
+            Self::Files { uri_list, .. } if mime == FILE_URI_LIST_MIME => Some(uri_list),
+            Self::Files {
+                gnome_copied_files, ..
+            } if mime == GNOME_COPIED_FILES_MIME => Some(gnome_copied_files),
+            _ => None,
         }
     }
 }
