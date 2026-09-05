@@ -4,27 +4,13 @@
 
 ### Added
 
-- Added clipboard file transfer from the Hyprland desktop to the RDP client, carrying whole directory trees over the clipboard channel.
+- Added clipboard file transfer in both directions between the Hyprland desktop and the RDP client, carrying whole directory trees.
 - Added `file_transfer_mode`, `file_transfer_max_entries`, and `file_transfer_max_chunk_bytes` settings, each also a command-line flag.
 - Added outbound filename adjustment so names illegal on the client's filesystem still arrive, with collisions disambiguated.
-- Added clipboard file transfer from the RDP client to the Hyprland desktop, behind the default-on `client-to-server` build feature. The client's selection is offered to Wayland as both `text/uri-list` and `x-special/gnome-copied-files`, and served from a private read-only FUSE mount whose reads are fetched from the client on demand, so a paste completes at once however large the files are.
-- Added bounded failure for those reads: each waits at most 30 seconds for the client, and a change of the client's clipboard fails every read still waiting at once, so a dead connection surfaces an I/O error instead of hanging.
-- Added mount cleanup — unmounted with the session, and a mount orphaned by an abnormal exit swept away at the next start — needing no change to `/etc/fuse.conf` and never using `allow_other`.
-- Added graceful degradation for the direction: a build or a machine without FUSE serves the desktop-to-client direction alone instead of failing to start, warning when the operator asked for `to-server` or `both` by name.
-
-### Fixed
-
-- Fixed stale directory walks re-advertising files after the clipboard selection changed.
-- Fixed file identity validation to check the opened file and reject replacements, including FIFOs without blocking.
-- Bounded directory inspection and buffering by the entry limit, including skipped entries.
-- Fixed directory symlink aliases being mistaken for ancestor cycles and omitted from transfers.
-- Fixed pending client-file reads not being cancelled when the desktop clipboard owner changes.
-- Fixed only the first file copy on the client reaching the desktop in a session. The request state that dedupes repeated announcements of one clipboard selection was cleared when an ordinary format answer arrived but not when a file list did, so every later file copy was dropped as a repeat and the mount kept serving the first selection.
-- Fixed files pasted from the client arriving read-only. The mount reported every file as
-  mode 0400 and every directory as 0500, and a file manager copies the source mode, so a
-  pasted file landed unwritable by the user who pasted it. Files now arrive 0644 and
-  directories 0755, as they do in a GNOME session; only an entry the client itself marked
-  read-only arrives read-only. The mount stays read-only.
+- Added the client-to-server direction behind the default-on `client-to-server` build feature, serving the client's selection from a private read-only FUSE mount fetched on demand, so a paste completes at once however large the files are and pasted entries land 0644/0755.
+- Added bounded failure for those reads: 30 seconds each, and every pending read fails when the clipboard owner changes, so a dead connection surfaces an I/O error instead of hanging.
+- Added mount cleanup at session end and at the next start after an abnormal exit, needing no change to `/etc/fuse.conf` and never using `allow_other`.
+- Added graceful degradation without FUSE: the desktop-to-client direction still runs, warning when the operator asked for `to-server` or `both` by name.
 
 ## [0.1.5] - 2026-08-19
 
@@ -100,7 +86,6 @@
 
 - Initial public release.
 
-[Unreleased]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.5...HEAD
 [0.1.5]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.2...v0.1.3
