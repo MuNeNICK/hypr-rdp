@@ -285,7 +285,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
         // protocol library parse the descriptors and call on_remote_file_list.
         // Prefer it while this direction is enabled, then retain the ordinary
         // text/image preference for all other clipboard selections.
-        let format = self
+        let file_list_format = self
             .file_transfer_mode
             .permits_to_server()
             .then(|| {
@@ -294,12 +294,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
                     .find(|format| format.name.as_ref() == Some(&ClipboardFormatName::FILE_LIST))
                     .map(|format| format.id)
             })
-            .flatten()
-            .or_else(|| {
-                SelectionKind::REMOTE_PREFERENCE
-                    .into_iter()
-                    .find_map(|kind| Self::remote_format_for_kind(kind, available_formats))
-            });
+            .flatten();
+
+        let format = file_list_format.or_else(|| {
+            SelectionKind::REMOTE_PREFERENCE
+                .into_iter()
+                .find_map(|kind| Self::remote_format_for_kind(kind, available_formats))
+        });
 
         let Some(format) = format else {
             self.last_requested_format = None;
@@ -309,7 +310,15 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
         // Format Data Responses carry no request ID. Keep one request state for
         // repeated announcements that select the same format.
-        if self.last_requested_format == Some(format) {
+        //
+        // The file list is the exception, because its answer is not correlated
+        // the same way: the protocol library recognizes it by the request it
+        // remembers, and it forgets that request on every format list it
+        // receives. So an announcement that repeats while our request is still
+        // in flight has already made that request unanswerable — dropping the
+        // repeat as redundant loses the copy entirely, and the desktop keeps
+        // offering the previous selection, which is what the user pastes.
+        if Some(format) != file_list_format && self.last_requested_format == Some(format) {
             return;
         }
 
@@ -999,6 +1008,43 @@ mod tests {
 
         let ClipboardMessage::SendInitiatePaste(format) = recv_clipboard_event(&mut events) else {
             panic!("the second copy must be fetched too, not dropped as a repeat");
+        };
+        assert_eq!(format, ClipboardFormatId::new(0xc001));
+    }
+
+    /// One copy announced twice must still be fetched.
+    ///
+    /// A client may announce a single copy more than once — a clipboard manager
+    /// re-taking the selection is enough, and Windows clients do it on their
+    /// own — and the second announcement can arrive while our request for the
+    /// file list is still in flight. The protocol library drops the request it
+    /// correlates the file list with on every format list it receives, so that
+    /// in-flight request can no longer be answered as a file list: its response
+    /// arrives as ordinary format data and is discarded. Treating the repeat as
+    /// redundant therefore loses the whole copy silently. The desktop keeps
+    /// offering the mount contents of the previous copy, and the next paste
+    /// delivers the file copied before this one.
+    #[cfg(feature = "client-to-server")]
+    #[test]
+    fn a_copy_announced_twice_is_fetched_again_while_the_first_request_is_unanswered() {
+        let (mut backend, mut events) = backend_with_events();
+        let file_list = ClipboardFormat::new(ClipboardFormatId::new(0xc001))
+            .with_name(ClipboardFormatName::FILE_LIST);
+
+        backend.on_remote_copy(std::slice::from_ref(&file_list));
+        assert!(
+            matches!(
+                recv_clipboard_event(&mut events),
+                ClipboardMessage::SendInitiatePaste(_)
+            ),
+            "the copy is fetched"
+        );
+
+        // No file list has come back yet: this is the same copy, announced again.
+        backend.on_remote_copy(std::slice::from_ref(&file_list));
+
+        let ClipboardMessage::SendInitiatePaste(format) = recv_clipboard_event(&mut events) else {
+            panic!("the repeat must re-issue the request the announcement invalidated");
         };
         assert_eq!(format, ClipboardFormatId::new(0xc001));
     }
