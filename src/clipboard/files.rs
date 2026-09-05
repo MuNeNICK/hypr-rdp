@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -110,6 +110,7 @@ pub(super) fn freeze_regular_files(paths: Vec<PathBuf>) -> Vec<FrozenFile> {
 pub(super) fn freeze_paths(paths: Vec<PathBuf>, max_entries: usize) -> Vec<FrozenFile> {
     let mut files = Vec::new();
     let mut visited_directories = HashSet::new();
+    let mut used_names = HashMap::new();
 
     for path in paths {
         freeze_path(
@@ -118,6 +119,7 @@ pub(super) fn freeze_paths(paths: Vec<PathBuf>, max_entries: usize) -> Vec<Froze
             0,
             max_entries,
             &mut visited_directories,
+            &mut used_names,
             &mut files,
         );
         if files.len() == max_entries {
@@ -138,6 +140,7 @@ fn freeze_path(
     depth: usize,
     max_entries: usize,
     visited_directories: &mut HashSet<(u64, u64)>,
+    used_names: &mut HashMap<Vec<String>, HashSet<String>>,
     files: &mut Vec<FrozenFile>,
 ) {
     if files.len() == max_entries {
@@ -159,16 +162,8 @@ fn freeze_path(
             return;
         }
     };
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        tracing::warn!(
-            ?path,
-            "Clipboard: skipping non-Unicode filename until name translation is enabled"
-        );
-        return;
-    };
-    let name = name.to_owned();
-
     if metadata.is_file() {
+        let name = unique_file_name(parent, path, used_names);
         files.push(frozen_file(
             path.clone(),
             parent,
@@ -187,6 +182,8 @@ fn freeze_path(
         tracing::warn!(?path, "Clipboard: skipping directory symlink cycle");
         return;
     }
+
+    let name = unique_file_name(parent, path, used_names);
 
     files.push(frozen_file(
         path.clone(),
@@ -226,6 +223,7 @@ fn freeze_path(
             depth + 1,
             max_entries,
             visited_directories,
+            used_names,
             files,
         );
         if files.len() == max_entries {
@@ -242,12 +240,87 @@ fn freeze_path(
             depth + 1,
             max_entries,
             visited_directories,
+            used_names,
             files,
         );
         if files.len() == max_entries {
             return;
         }
     }
+}
+
+fn unique_file_name(
+    parent: &[String],
+    path: &PathBuf,
+    used_names: &mut HashMap<Vec<String>, HashSet<String>>,
+) -> String {
+    let raw_name = path
+        .file_name()
+        .map(|name| String::from_utf8_lossy(name.as_encoded_bytes()).into_owned())
+        .unwrap_or_else(|| "unnamed".into());
+    let sanitized = sanitize_file_name(&raw_name);
+    let used = used_names.entry(parent.to_vec()).or_default();
+    let mut candidate = sanitized.clone();
+    let (stem, extension) = split_extension(&sanitized);
+    let mut suffix = 2;
+    while !used.insert(windows_name_key(&candidate)) {
+        candidate = format!("{stem} ({suffix}){extension}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let mut sanitized: String = name
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            ) || character <= '\u{1f}'
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    sanitized = sanitized.trim_end_matches(['.', ' ']).to_owned();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        sanitized = "unnamed".into();
+    }
+
+    let (stem, extension) = split_extension(&sanitized);
+    if is_windows_device_name(stem) {
+        sanitized = format!("{stem}_{extension}");
+    }
+    sanitized
+}
+
+fn split_extension(name: &str) -> (&str, &str) {
+    let Some(index) = name.rfind('.') else {
+        return (name, "");
+    };
+    if index == 0 {
+        (name, "")
+    } else {
+        name.split_at(index)
+    }
+}
+
+fn is_windows_device_name(stem: &str) -> bool {
+    let name = stem.to_ascii_uppercase();
+    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || name
+            .strip_prefix("COM")
+            .or_else(|| name.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+}
+
+fn windows_name_key(name: &str) -> String {
+    name.to_uppercase()
 }
 
 fn frozen_file(
