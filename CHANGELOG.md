@@ -8,9 +8,13 @@
 - Added `file_transfer_mode`, `file_transfer_max_entries`, and `file_transfer_max_chunk_bytes` settings, each also a command-line flag.
 - Added outbound filename adjustment so names illegal on the client's filesystem still arrive, with collisions disambiguated.
 - Added clipboard file transfer from the RDP client to the Hyprland desktop, behind the default-on `client-to-server` build feature. The client's selection is offered to Wayland as both `text/uri-list` and `x-special/gnome-copied-files`, and served from a private read-only FUSE mount whose reads are fetched from the client on demand, so a paste completes at once however large the files are.
-- Added bounded failure for those reads: each waits at most 30 seconds for the client, and every read still waiting fails at once when the session ends or the client's clipboard changes owner, so a dead connection surfaces an I/O error instead of hanging.
+- Added bounded failure for those reads: each waits at most 30 seconds for the client, and a change of the client's clipboard fails every read still waiting at once, so a dead connection surfaces an I/O error instead of hanging.
 - Added mount cleanup — unmounted with the session, and a mount orphaned by an abnormal exit swept away at the next start — needing no change to `/etc/fuse.conf` and never using `allow_other`.
 - Added graceful degradation for the direction: a build or a machine without FUSE serves the desktop-to-client direction alone instead of failing to start, warning when the operator asked for `to-server` or `both` by name.
+
+### Fixed
+
+- Fixed only the first file copy on the client reaching the desktop in a session. The request state that dedupes repeated announcements of one clipboard selection was cleared when an ordinary format answer arrived but not when a file list did, so every later file copy was dropped as a repeat and the mount kept serving the first selection.
 
 ## [0.1.5] - 2026-08-19
 

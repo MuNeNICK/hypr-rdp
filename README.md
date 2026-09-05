@@ -229,15 +229,25 @@ Because the bytes come from the client on demand, **the mount only works while t
 is connected**. A copy still running when the session ends, or when the client stops
 answering, fails with an ordinary I/O error rather than hanging:
 
-- Each range read waits at most 30 seconds for the client before failing that read.
-- Every read still waiting is failed at once — without waiting out that 30 seconds — when
-  the session ends or the client's clipboard changes owner.
+- Each range read waits at most 30 seconds for the client before failing that read. A
+  large copy has more than one read in flight and the kernel reissues after a failure, so
+  the copying process itself sees the error after a small multiple of that.
+- A change of the client's clipboard fails every read still waiting at once, without
+  waiting out those 30 seconds.
+- A session that ends also fails them, but currently by letting them time out rather than
+  immediately, so a copy can sit for up to about a minute before it reports the error.
 - The mount is unmounted and its directory removed when the session ends. One left behind
   by a server that was killed is swept away the next time hypr-rdp starts, so a bad exit
   does not leave a broken directory in your runtime directory.
 
 The mount is read-only. You paste *out* of it; nothing can be written into it, and it is
 not a way to put files onto the client.
+
+**Copying anything on the Hyprland desktop ends the paste you have not finished.** The
+client hands its file list over once per copy and discards it as soon as the desktop
+announces a clipboard of its own, so files from an earlier client copy start returning I/O
+errors even though the mount still lists them. Copy again on the client and the mount
+refreshes. Finish a large paste before you copy something else on the desktop.
 
 This direction is the `client-to-server` build feature, **enabled by default**. It is
 optional because it needs FUSE at runtime, which not every machine offers:
@@ -276,10 +286,12 @@ all keep working.
 
 Every key is also a command-line flag (`--file-transfer-mode` and so on).
 
-A mode that excludes `to-client` stops files being transferred to the client, but a file
-copied in a Hyprland file manager still reaches the client's clipboard as **text**: the
-selection's `file://` URI list is published as ordinary text when it cannot be offered as
-files. Paths leave the machine in that case even though contents do not.
+A mode that excludes a direction stops files being *transferred* that way, but not the
+selection's paths, in either direction. A file copied in a Hyprland file manager still
+reaches the client's clipboard as **text** — the `file://` URI list published as ordinary
+text when it cannot be offered as files — and a file copied on the client likewise reaches
+the desktop as the client's own path text. Paths cross in both cases even though contents
+do not.
 
 ### Options
 

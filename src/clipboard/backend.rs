@@ -380,6 +380,14 @@ impl CliprdrBackend for HyprCliprdrBackend {
         files: &[ironrdp_cliprdr::pdu::FileDescriptor],
         _clip_data_id: Option<u32>,
     ) {
+        // This is where a file list answers the request `on_remote_copy` made,
+        // the way `handle_format_data_response` answers it for every other
+        // format. Clear the same request state it clears: left set, it makes
+        // `on_remote_copy` read the client's next file copy as a repeat of this
+        // one and drop it, so only the first copy of a session ever arrives.
+        self.last_requested_format = None;
+        self.pending_echo_candidate = None;
+
         if !self.file_transfer_mode.permits_to_server() {
             return;
         }
@@ -949,6 +957,43 @@ mod tests {
             events.blocking_recv()
         else {
             panic!("expected delayed file-list request");
+        };
+        assert_eq!(format, ClipboardFormatId::new(0xc001));
+    }
+
+    /// A second copy on the client must reach the desktop like the first.
+    ///
+    /// `last_requested_format` dedupes repeated announcements of one selection,
+    /// and `handle_format_data_response` clears it when the answer arrives. A
+    /// file list does not come back that way — it arrives at
+    /// `on_remote_file_list` — so if that arm does not clear the state too, the
+    /// id stays set, every later announcement of the same format is dropped as
+    /// a repeat, and only the first file copy of a whole session is ever
+    /// honoured. Found against a real client in the slice 2 acceptance pass:
+    /// the mount kept serving the first selection and no later copy appeared.
+    #[cfg(feature = "client-to-server")]
+    #[test]
+    fn a_later_file_copy_on_the_client_is_fetched_like_the_first() {
+        use ironrdp_cliprdr::pdu::FileDescriptor;
+
+        let (mut backend, mut events) = backend_with_events();
+        let file_list = ClipboardFormat::new(ClipboardFormatId::new(0xc001))
+            .with_name(ClipboardFormatName::FILE_LIST);
+
+        backend.on_remote_copy(std::slice::from_ref(&file_list));
+        assert!(
+            matches!(
+                recv_clipboard_event(&mut events),
+                ClipboardMessage::SendInitiatePaste(_)
+            ),
+            "the first copy is fetched"
+        );
+        backend.on_remote_file_list(&[FileDescriptor::new("one.txt").with_file_size(3)], None);
+
+        backend.on_remote_copy(std::slice::from_ref(&file_list));
+
+        let ClipboardMessage::SendInitiatePaste(format) = recv_clipboard_event(&mut events) else {
+            panic!("the second copy must be fetched too, not dropped as a repeat");
         };
         assert_eq!(format, ClipboardFormatId::new(0xc001));
     }
