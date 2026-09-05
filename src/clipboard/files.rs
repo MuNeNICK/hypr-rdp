@@ -17,8 +17,9 @@ use ironrdp_cliprdr::pdu::{
 use ironrdp_server::ServerEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
-const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
-const MAX_DIRECTORY_DEPTH: usize = 128;
+/// Seconds between the FILETIME epoch (1601) and the Unix epoch.
+pub(super) const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+pub(super) const MAX_DIRECTORY_DEPTH: usize = 128;
 
 #[derive(Clone, Debug)]
 pub(super) struct FrozenFile {
@@ -394,6 +395,16 @@ fn filetime(modified: Option<SystemTime>) -> u64 {
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| (duration.as_secs().saturating_add(WINDOWS_EPOCH_OFFSET_SECS)) * 10_000_000)
         .unwrap_or_default()
+}
+
+/// The inverse of [`filetime`], for the descriptors a client sends us.
+/// Only the inbound direction reads times off the wire.
+/// `None` for the zero value the protocol uses to mean "not carried", and for
+/// any stamp older than the Unix epoch.
+#[cfg(feature = "client-to-server")]
+pub(super) fn system_time(filetime: u64) -> Option<SystemTime> {
+    let seconds = (filetime / 10_000_000).checked_sub(WINDOWS_EPOCH_OFFSET_SECS)?;
+    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
 }
 
 fn read_file_contents(

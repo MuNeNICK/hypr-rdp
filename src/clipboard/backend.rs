@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
-#[cfg(test)]
-use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
     FileContentsRequest, FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::{PackedFileList, MAX_FILE_COUNT};
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
@@ -121,7 +121,7 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let remote_files = self
             .event_sender
             .as_ref()
-            .map(|sender| RemoteFiles::new(sender.clone()));
+            .map(|sender| RemoteFiles::new(sender.clone(), self.file_transfer_max_entries));
 
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
@@ -732,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn remote_file_reads_use_the_clipboard_callback_seam() {
         let (mut backend, mut events) = backend_with_events();
-        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap());
+        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
         backend.remote_files = Some(remote_files.clone());
 
         let read = remote_files.read(0, 3, 5);
@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn clipboard_owner_change_cancels_pending_remote_file_reads() {
         let (mut backend, mut events) = backend_with_events();
-        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap());
+        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
         backend.remote_files = Some(remote_files.clone());
 
         let read = remote_files.read(0, 0, 1);
@@ -766,6 +766,69 @@ mod tests {
         assert!(read.await.unwrap().is_err());
     }
 
+    /// A folder the client copied arrives as a flat descriptor list whose
+    /// relative paths describe the tree. Rebuilding that tree is what the
+    /// mount browses, and a read of a file several levels down has to reach
+    /// the client as a request for that file's index in the original list.
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn a_pasted_folder_reads_its_nested_files_through_the_callback_seam() {
+        use super::super::remote_tree::{RemoteNodeKind, ROOT_INODE};
+        use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileDescriptor};
+
+        let (mut backend, mut events) = backend_with_events();
+        let remote_files = RemoteFiles::new(backend.event_sender.clone().unwrap(), MAX_FILE_COUNT);
+        backend.remote_files = Some(remote_files.clone());
+
+        let advertised = remote_files.accept(&[
+            FileDescriptor::new("project").with_attributes(ClipboardFileAttributes::DIRECTORY),
+            FileDescriptor::new("src")
+                .with_attributes(ClipboardFileAttributes::DIRECTORY)
+                .with_relative_path("project"),
+            FileDescriptor::new("main.rs")
+                .with_attributes(ClipboardFileAttributes::NORMAL)
+                .with_file_size(5)
+                .with_relative_path("project\\src"),
+            FileDescriptor::new("empty")
+                .with_attributes(ClipboardFileAttributes::DIRECTORY)
+                .with_relative_path("project"),
+        ]);
+
+        assert_eq!(advertised, ["project"]);
+        let (empty, kind) = remote_files
+            .resolve("project/empty")
+            .expect("the empty directory is browsable");
+        assert_eq!(kind, RemoteNodeKind::Directory);
+        assert!(remote_files.child_names(empty).is_empty());
+        assert_eq!(remote_files.child_names(ROOT_INODE), ["project"]);
+
+        let (_, kind) = remote_files
+            .resolve("project/src/main.rs")
+            .expect("the nested file is browsable");
+        let RemoteNodeKind::File { index } = kind else {
+            panic!("expected a readable file at the bottom of the tree");
+        };
+
+        let read = remote_files.read(index, 0, 5);
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(request))) =
+            events.recv().await
+        else {
+            panic!("expected a remote file-content request");
+        };
+        assert_eq!(request.index, 2);
+
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(
+            request.stream_id,
+            b"crate".to_vec(),
+        ));
+
+        assert_eq!(read.await.unwrap().unwrap(), b"crate");
+    }
+
+    /// Gated: without the feature, `permits_to_server` is false and the
+    /// backend never asks for the file list, so the receive below would block
+    /// forever rather than fail.
+    #[cfg(feature = "client-to-server")]
     #[test]
     fn client_file_format_starts_the_delayed_file_list_exchange() {
         let (mut backend, mut events) = backend_with_events();

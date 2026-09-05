@@ -10,6 +10,8 @@ mod backend;
 mod files;
 mod formats;
 mod remote;
+#[cfg(feature = "client-to-server")]
+mod remote_tree;
 mod wayland;
 
 pub use backend::HyprCliprdrFactory;

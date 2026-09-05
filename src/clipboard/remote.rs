@@ -14,12 +14,10 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use super::formats::PendingWrite;
+#[cfg(feature = "client-to-server")]
+use super::remote_tree::{RemoteNode, RemoteNodeKind, RemoteTree};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "client-to-server")]
-const FIRST_FILE_INDEX: i32 = 0;
-#[cfg(feature = "client-to-server")]
-const REMOTE_FILE_INODE: fuser::INodeNo = fuser::INodeNo(2);
 
 #[derive(Clone)]
 pub(super) struct RemoteFiles {
@@ -27,11 +25,18 @@ pub(super) struct RemoteFiles {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     runtime: Handle,
     #[cfg(feature = "client-to-server")]
+    max_entries: usize,
+    #[cfg(feature = "client-to-server")]
     mount: Arc<Mutex<Option<MountedRemoteFiles>>>,
 }
 
 struct RemoteState {
+    /// The client's list, in the order it sent it: a content request names a
+    /// file by its index here.
     files: Vec<FileDescriptor>,
+    /// The same list as the browsable tree its relative paths describe.
+    #[cfg(feature = "client-to-server")]
+    tree: RemoteTree,
     next_stream_id: u32,
     pending: HashMap<u32, PendingRead>,
 }
@@ -48,44 +53,74 @@ struct MountedRemoteFiles {
 }
 
 impl RemoteFiles {
-    pub(super) fn new(event_sender: mpsc::UnboundedSender<ServerEvent>) -> Self {
+    pub(super) fn new(
+        event_sender: mpsc::UnboundedSender<ServerEvent>,
+        max_entries: usize,
+    ) -> Self {
+        #[cfg(not(feature = "client-to-server"))]
+        let _ = max_entries;
         Self {
             inner: Arc::new(Mutex::new(RemoteState {
                 files: Vec::new(),
+                #[cfg(feature = "client-to-server")]
+                tree: RemoteTree::empty(),
                 next_stream_id: 1,
                 pending: HashMap::new(),
             })),
             event_sender,
             runtime: Handle::current(),
             #[cfg(feature = "client-to-server")]
+            max_entries,
+            #[cfg(feature = "client-to-server")]
             mount: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Records the client's list and returns the entries the Wayland side
+    /// advertises as URIs, which are the ones the user selected.
+    ///
+    /// Split from [`RemoteFiles::advertise`] so the inbound tree can be driven
+    /// without a mount.
+    #[cfg(feature = "client-to-server")]
+    pub(super) fn accept(&self, files: &[FileDescriptor]) -> Vec<String> {
+        let Ok(mut state) = self.inner.lock() else {
+            return Vec::new();
+        };
+        state.tree = RemoteTree::build(files, self.max_entries, state.tree.next_base());
+        state.files = files.to_vec();
+        state
+            .tree
+            .roots()
+            .iter()
+            .filter_map(|root| state.tree.node(*root).map(|node| node.name.clone()))
+            .collect()
+    }
+
     #[cfg(feature = "client-to-server")]
     pub(super) fn advertise(&self, files: &[FileDescriptor]) -> Option<PendingWrite> {
-        let first = files.first()?;
-        if !is_safe_file_name(&first.name) {
-            tracing::warn!(name = %first.name, "Clipboard: refusing unsafe remote file name");
+        let roots = self.accept(files);
+        if roots.is_empty() {
+            tracing::warn!("Clipboard: the client's file list held nothing that can be pasted");
             return None;
-        }
-        {
-            let mut state = self.inner.lock().ok()?;
-            state.files = files.to_vec();
         }
 
         let path = self.mount()?;
-
-        let uri = format!(
-            "{}\r\n",
-            url::Url::from_file_path(path.join(&first.name))
-                .ok()?
-                .as_str()
-        );
-        let gnome = format!("copy\n{uri}");
+        // Only the selected entries are advertised; a file manager walks into
+        // whichever of them are directories through the mount itself.
+        let uris: Vec<String> = roots
+            .iter()
+            .filter_map(|name| Some(url::Url::from_file_path(path.join(name)).ok()?.to_string()))
+            .collect();
+        if uris.is_empty() {
+            return None;
+        }
         Some(PendingWrite::Files {
-            uri_list: uri.into_bytes(),
-            gnome_copied_files: gnome.into_bytes(),
+            uri_list: uris
+                .iter()
+                .map(|uri| format!("{uri}\r\n"))
+                .collect::<String>()
+                .into_bytes(),
+            gnome_copied_files: format!("copy\n{}", uris.join("\n")).into_bytes(),
         })
     }
 
@@ -180,12 +215,48 @@ impl RemoteFiles {
         }
     }
 
+    /// Reads the advertised tree under the state lock. `None` means the lock is
+    /// poisoned, which the filesystem answers as an ordinary lookup failure.
     #[cfg(feature = "client-to-server")]
-    fn first_file(&self) -> Option<FileDescriptor> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|state| state.files.first().cloned())
+    fn with_tree<T>(&self, read: impl FnOnce(&RemoteTree) -> T) -> Option<T> {
+        self.inner.lock().ok().map(|state| read(&state.tree))
+    }
+
+    /// Walks a `/`-separated path from the root the way the mount's lookup
+    /// does, so a test can assert on the tree a file manager would browse.
+    #[cfg(all(test, feature = "client-to-server"))]
+    pub(super) fn resolve(&self, path: &str) -> Option<(u64, RemoteNodeKind)> {
+        self.with_tree(|tree| {
+            let inode = tree.resolve(path)?;
+            Some((inode, tree.node(inode)?.kind))
+        })
+        .flatten()
+    }
+
+    #[cfg(all(test, feature = "client-to-server"))]
+    pub(super) fn child_names(&self, inode: u64) -> Vec<String> {
+        self.with_tree(|tree| {
+            tree.children(inode)
+                .iter()
+                .filter_map(|child| tree.node(*child).map(|node| node.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    #[cfg(feature = "client-to-server")]
+    fn attr(&self, inode: fuser::INodeNo) -> Option<fuser::FileAttr> {
+        self.with_tree(|tree| {
+            tree.node(inode.0)
+                .map(|node| node_attr(tree, inode.0, node))
+        })
+        .flatten()
+    }
+
+    #[cfg(feature = "client-to-server")]
+    fn kind(&self, inode: fuser::INodeNo) -> Option<RemoteNodeKind> {
+        self.with_tree(|tree| tree.node(inode.0).map(|node| node.kind))
+            .flatten()
     }
 
     #[cfg(feature = "client-to-server")]
@@ -223,15 +294,6 @@ impl RemoteFiles {
     }
 }
 
-#[cfg(feature = "client-to-server")]
-fn is_safe_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains(['/', '\\'])
-        && std::path::Path::new(name).is_relative()
-        && name != "."
-        && name != ".."
-}
-
 fn respond(state: &Arc<Mutex<RemoteState>>, stream_id: u32, result: Result<Vec<u8>, ()>) {
     if let Ok(mut state) = state.lock() {
         if let Some(pending) = state.pending.remove(&stream_id) {
@@ -240,6 +302,11 @@ fn respond(state: &Arc<Mutex<RemoteState>>, stream_id: u32, result: Result<Vec<u
     }
 }
 
+/// The mount's view of the advertised tree.
+///
+/// Deliberately thin: every handler is a tree lookup, and a read translates an
+/// inode into the same index-and-range request the backend seam already
+/// exercises without a mount.
 #[cfg(feature = "client-to-server")]
 #[derive(Clone)]
 struct RemoteFilesystem {
@@ -255,7 +322,7 @@ impl fuser::Filesystem for RemoteFilesystem {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        match file_attr(&self.files, ino) {
+        match self.files.attr(ino) {
             Some(attr) => reply.attr(&Duration::ZERO, &attr),
             None => reply.error(fuser::Errno::ENOENT),
         }
@@ -268,16 +335,19 @@ impl fuser::Filesystem for RemoteFilesystem {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let file = self.files.first_file();
-        match (parent, file) {
-            (fuser::INodeNo::ROOT, Some(file)) if name == std::ffi::OsStr::new(&file.name) => {
-                reply.entry(
-                    &Duration::ZERO,
-                    &file_attr(&self.files, REMOTE_FILE_INODE).expect("remote file exists"),
-                    fuser::Generation(0),
-                );
-            }
-            _ => reply.error(fuser::Errno::ENOENT),
+        // Every name in the tree arrived as UTF-16 on the wire, so a name that
+        // is not valid UTF-8 cannot be in it.
+        let found = name.to_str().and_then(|name| {
+            self.files
+                .with_tree(|tree| {
+                    let inode = tree.lookup(parent.0, name)?;
+                    Some(node_attr(tree, inode, tree.node(inode)?))
+                })
+                .flatten()
+        });
+        match found {
+            Some(attr) => reply.entry(&Duration::ZERO, &attr, fuser::Generation(0)),
+            None => reply.error(fuser::Errno::ENOENT),
         }
     }
 
@@ -289,26 +359,37 @@ impl fuser::Filesystem for RemoteFilesystem {
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        if ino != fuser::INodeNo::ROOT {
-            reply.error(fuser::Errno::ENOTDIR);
-            return;
-        }
-        let file = self.files.first_file();
-        let entries = [
-            (fuser::INodeNo::ROOT, fuser::FileType::Directory, ".".into()),
-            (
-                fuser::INodeNo::ROOT,
-                fuser::FileType::Directory,
-                "..".into(),
-            ),
-        ]
-        .into_iter()
-        .chain(
-            file.into_iter()
-                .map(|file| (REMOTE_FILE_INODE, fuser::FileType::RegularFile, file.name)),
-        );
-        for (entry_offset, (inode, kind, name)) in entries.enumerate().skip(offset as usize) {
-            if reply.add(inode, (entry_offset + 1) as u64, kind, name) {
+        let listing = self
+            .files
+            .with_tree(|tree| {
+                let Some(node) = tree.node(ino.0) else {
+                    return Err(fuser::Errno::ENOENT);
+                };
+                if !node.is_directory() {
+                    return Err(fuser::Errno::ENOTDIR);
+                }
+                let mut entries = vec![
+                    (ino.0, fuser::FileType::Directory, ".".to_owned()),
+                    (node.parent, fuser::FileType::Directory, "..".to_owned()),
+                ];
+                entries.extend(tree.children(ino.0).iter().filter_map(|inode| {
+                    let child = tree.node(*inode)?;
+                    Some((*inode, file_type(child), child.name.clone()))
+                }));
+                Ok(entries)
+            })
+            .unwrap_or(Err(fuser::Errno::ENOENT));
+        let entries = match listing {
+            Ok(entries) => entries,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        for (entry_offset, (inode, kind, name)) in
+            entries.into_iter().enumerate().skip(offset as usize)
+        {
+            if reply.add(fuser::INodeNo(inode), (entry_offset + 1) as u64, kind, name) {
                 break;
             }
         }
@@ -322,10 +403,14 @@ impl fuser::Filesystem for RemoteFilesystem {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        if ino == REMOTE_FILE_INODE {
-            reply.opened(fuser::FileHandle(0), fuser::FopenFlags::FOPEN_DIRECT_IO);
-        } else {
-            reply.error(fuser::Errno::ENOENT);
+        match self.files.kind(ino) {
+            // Direct I/O so read sizes reach us unmodified and nothing is
+            // cached on top of content fetched one range at a time.
+            Some(RemoteNodeKind::File { .. }) => {
+                reply.opened(fuser::FileHandle(0), fuser::FopenFlags::FOPEN_DIRECT_IO)
+            }
+            Some(RemoteNodeKind::Directory) => reply.error(fuser::Errno::EISDIR),
+            None => reply.error(fuser::Errno::ENOENT),
         }
     }
 
@@ -340,11 +425,11 @@ impl fuser::Filesystem for RemoteFilesystem {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        if ino != REMOTE_FILE_INODE {
+        let Some(RemoteNodeKind::File { index }) = self.files.kind(ino) else {
             reply.error(fuser::Errno::ENOENT);
             return;
-        }
-        let receiver = self.files.read(FIRST_FILE_INDEX, offset, size);
+        };
+        let receiver = self.files.read(index, offset, size);
         self.files.runtime.spawn(async move {
             match receiver.await {
                 Ok(Ok(data)) => reply.data(&data),
@@ -355,36 +440,32 @@ impl fuser::Filesystem for RemoteFilesystem {
 }
 
 #[cfg(feature = "client-to-server")]
-fn file_attr(files: &RemoteFiles, ino: fuser::INodeNo) -> Option<fuser::FileAttr> {
-    let file = files.first_file()?;
-    let now = std::time::SystemTime::now();
-    Some(fuser::FileAttr {
-        ino,
-        size: if ino == fuser::INodeNo::ROOT {
-            0
-        } else {
-            file.file_size.unwrap_or(0)
-        },
-        blocks: 0,
-        atime: now,
-        mtime: now,
-        ctime: now,
-        crtime: now,
-        kind: if ino == fuser::INodeNo::ROOT {
-            fuser::FileType::Directory
-        } else {
-            fuser::FileType::RegularFile
-        },
-        perm: if ino == fuser::INodeNo::ROOT {
-            0o500
-        } else {
-            0o400
-        },
-        nlink: 1,
+fn file_type(node: &RemoteNode) -> fuser::FileType {
+    if node.is_directory() {
+        fuser::FileType::Directory
+    } else {
+        fuser::FileType::RegularFile
+    }
+}
+
+#[cfg(feature = "client-to-server")]
+fn node_attr(tree: &RemoteTree, inode: u64, node: &RemoteNode) -> fuser::FileAttr {
+    let directory = node.is_directory();
+    fuser::FileAttr {
+        ino: fuser::INodeNo(inode),
+        size: node.size,
+        blocks: node.size.div_ceil(512),
+        atime: node.modified,
+        mtime: node.modified,
+        ctime: node.modified,
+        crtime: node.modified,
+        kind: file_type(node),
+        perm: if directory { 0o500 } else { 0o400 },
+        nlink: tree.link_count(inode),
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
         rdev: 0,
         blksize: 4096,
         flags: 0,
-    })
+    }
 }
