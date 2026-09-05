@@ -52,6 +52,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         on_session_end,
         file_transfer_mode,
         file_transfer_max_chunk_bytes,
+        file_transfer_max_entries,
     } = config;
 
     let egfx_shared = Arc::new(EgfxShared::with_codec_policy(
@@ -86,8 +87,11 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let input_session_sink: Box<dyn RdpInputSessionSink> = Box::new(input_session_sink);
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
-    let cliprdr_factory =
-        HyprCliprdrFactory::new(file_transfer_mode, file_transfer_max_chunk_bytes);
+    let cliprdr_factory = HyprCliprdrFactory::new(
+        file_transfer_mode,
+        file_transfer_max_chunk_bytes,
+        file_transfer_max_entries,
+    );
     let sound_factory = sound_factory_for_audio_mode(audio_mode);
     let session_hooks =
         session_hooks_from_config(on_session_start, on_session_end, Some(hyprland_instance));

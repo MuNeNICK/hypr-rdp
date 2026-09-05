@@ -8,6 +8,8 @@ use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
@@ -75,14 +77,20 @@ pub struct HyprCliprdrFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     file_transfer_mode: FileTransferMode,
     file_transfer_max_chunk_bytes: u32,
+    file_transfer_max_entries: usize,
 }
 
 impl HyprCliprdrFactory {
-    pub fn new(file_transfer_mode: FileTransferMode, file_transfer_max_chunk_bytes: u32) -> Self {
+    pub fn new(
+        file_transfer_mode: FileTransferMode,
+        file_transfer_max_chunk_bytes: u32,
+        file_transfer_max_entries: usize,
+    ) -> Self {
         Self {
             event_sender: None,
             file_transfer_mode,
             file_transfer_max_chunk_bytes,
+            file_transfer_max_entries,
         }
     }
 }
@@ -106,6 +114,7 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
                 Arc::clone(&files),
                 sender.clone(),
                 self.file_transfer_max_chunk_bytes,
+                self.file_transfer_max_entries,
             )
         });
 
@@ -528,8 +537,11 @@ impl HyprCliprdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_cliprdr::pdu::FileDescriptor;
     use proptest::prelude::*;
     use std::io::{Cursor, Write};
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::Duration;
 
     const ONE_BY_ONE_RGBA_PNG: &[u8] = &[
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
@@ -590,7 +602,7 @@ mod tests {
         let files: FrozenFiles = Arc::new(Mutex::new(Some(
             super::super::files::freeze_regular_files(vec![path.clone()]),
         )));
-        let worker = FileWorker::start(Arc::clone(&files), event_tx.clone(), 8);
+        let worker = FileWorker::start(Arc::clone(&files), event_tx.clone(), 8, 100);
         let mut backend = HyprCliprdrBackend {
             event_sender: Some(event_tx),
             remote_formats: Vec::new(),
@@ -657,6 +669,157 @@ mod tests {
         });
         assert!(recv_file_response(&mut event_rx).is_error());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_worker_offers_a_bounded_directory_tree() {
+        let root = std::path::PathBuf::from("/tmp")
+            .join(format!("hrdp-worker-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+        std::fs::File::create(root.join("nested/document.txt"))
+            .unwrap()
+            .write_all(b"contents")
+            .unwrap();
+        std::os::unix::fs::symlink(&root, root.join("nested/loop")).unwrap();
+        let fifo = root.join("nested/ignored-fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let socket = std::os::unix::net::UnixDatagram::bind(root.join("nested/ignored-socket"))
+            .unwrap();
+
+        let (mut backend, mut events) = backend_with_events();
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            10,
+        );
+        worker.send(FileWorkerCommand::Freeze(vec![root.clone()]));
+
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the file offer");
+        };
+        let decoded = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
+        let root_name = root.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                root_name,
+                &format!("{root_name}\\nested"),
+                &format!("{root_name}\\nested\\empty"),
+                &format!("{root_name}\\nested\\document.txt"),
+            ]
+        );
+
+        drop(worker);
+
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            3,
+        );
+        worker.send(FileWorkerCommand::Freeze(vec![root.clone()]));
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a truncated file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the truncated file offer");
+        };
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            [root.file_name().unwrap().to_str().unwrap(), "nested", "empty"]
+        );
+
+        drop(worker);
+        drop(socket);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_offer_adjusts_names_that_windows_would_reject_without_dropping_them() {
+        let (mut backend, mut events) = backend_with_events();
+        let root = std::env::temp_dir().join(format!(
+            "hypr-rdp-name-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let paths = [
+            "a:b".into(),
+            "a?b".into(),
+            "CON.txt".into(),
+            "trailing. ".into(),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ]
+        .into_iter()
+        .map(|name: std::ffi::OsString| {
+            let path = root.join(name);
+            std::fs::File::create(&path).unwrap();
+            path
+        })
+        .collect();
+        *backend.files.lock().unwrap() = Some(super::super::files::freeze_paths(paths, 100));
+
+        backend.on_request_format_list();
+
+        let descriptors = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for file offer")
+                    .expect("backend stopped before offering files");
+                let ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors)) =
+                    event
+                else {
+                    panic!("expected a file offer");
+                };
+                descriptors
+            });
+        let decoded: Vec<FileDescriptor> = descriptors
+            .iter()
+            .map(|descriptor| {
+                ironrdp_core::decode(&ironrdp_core::encode_vec(descriptor).unwrap()).unwrap()
+            })
+            .collect();
+
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a_b", "a_b (2)", "CON_.txt", "trailing", "�"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

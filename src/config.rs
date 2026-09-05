@@ -10,6 +10,9 @@ use crate::egfx::{
     EgfxCodecPolicy, H264BackendPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT,
 };
 use crate::input::KeyboardLayoutPolicy;
+use ironrdp_cliprdr::pdu::MAX_FILE_COUNT;
+
+pub(crate) const DEFAULT_FILE_TRANSFER_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileTransferMode {
@@ -119,6 +122,10 @@ struct Args {
     #[arg(long)]
     file_transfer_max_chunk_bytes: Option<u32>,
 
+    /// Maximum files and directories enumerated from one clipboard selection
+    #[arg(long)]
+    file_transfer_max_entries: Option<usize>,
+
     /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
     #[arg(long)]
     config: Option<String>,
@@ -148,6 +155,7 @@ struct ConfigFile {
     on_session_end: Option<String>,
     file_transfer_mode: Option<String>,
     file_transfer_max_chunk_bytes: Option<u32>,
+    file_transfer_max_entries: Option<usize>,
 }
 
 impl ConfigFile {
@@ -218,6 +226,7 @@ pub struct RuntimeConfig {
     pub on_session_end: Option<String>,
     pub file_transfer_mode: FileTransferMode,
     pub file_transfer_max_chunk_bytes: u32,
+    pub file_transfer_max_entries: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -338,6 +347,10 @@ impl RuntimeConfig {
             .file_transfer_max_chunk_bytes
             .or(config.file_transfer_max_chunk_bytes)
             .unwrap_or(8 * 1024 * 1024);
+        let file_transfer_max_entries = args
+            .file_transfer_max_entries
+            .or(config.file_transfer_max_entries)
+            .unwrap_or(DEFAULT_FILE_TRANSFER_MAX_ENTRIES);
 
         let resolution = parse_resolution(&resolution_str)?;
         let capture_mode = parse_capture_mode(&capture_mode_str)?;
@@ -354,6 +367,7 @@ impl RuntimeConfig {
         if file_transfer_max_chunk_bytes == 0 {
             anyhow::bail!("file-transfer-max-chunk-bytes must be > 0");
         }
+        validate_file_transfer_max_entries(file_transfer_max_entries)?;
 
         Ok(Self {
             bind,
@@ -378,8 +392,21 @@ impl RuntimeConfig {
             on_session_end,
             file_transfer_mode,
             file_transfer_max_chunk_bytes,
+            file_transfer_max_entries,
         })
     }
+}
+
+fn validate_file_transfer_max_entries(value: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("file-transfer-max-entries must be > 0");
+    }
+    if value > MAX_FILE_COUNT {
+        anyhow::bail!(
+            "file-transfer-max-entries must be at most {MAX_FILE_COUNT}, the clipboard protocol limit"
+        );
+    }
+    Ok(())
 }
 
 fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
@@ -645,6 +672,14 @@ mod tests {
         assert!(!FileTransferMode::Off.permits_to_client());
         assert!(!FileTransferMode::ToServer.permits_to_client());
         assert!(parse_file_transfer_mode("invalid").is_err());
+    }
+
+    #[test]
+    fn file_transfer_entry_limit_stays_within_the_protocol_limit() {
+        assert!(validate_file_transfer_max_entries(1).is_ok());
+        assert!(validate_file_transfer_max_entries(MAX_FILE_COUNT).is_ok());
+        assert!(validate_file_transfer_max_entries(0).is_err());
+        assert!(validate_file_transfer_max_entries(MAX_FILE_COUNT + 1).is_err());
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

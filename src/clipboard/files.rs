@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -11,10 +12,13 @@ use ironrdp_cliprdr::pdu::{
     ClipboardFileAttributes, FileContentsFlags, FileContentsRequest, FileContentsResponse,
     FileDescriptor,
 };
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::MAX_FILE_COUNT;
 use ironrdp_server::ServerEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
 const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+const MAX_DIRECTORY_DEPTH: usize = 128;
 
 #[derive(Clone, Debug)]
 pub(super) struct FrozenFile {
@@ -42,6 +46,7 @@ impl FileWorker {
         files: FrozenFiles,
         event_sender: UnboundedSender<ServerEvent>,
         max_chunk_bytes: u32,
+        max_entries: usize,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let handle = thread::Builder::new()
@@ -50,7 +55,7 @@ impl FileWorker {
                 while let Ok(command) = receiver.recv() {
                     match command {
                         FileWorkerCommand::Freeze(paths) => {
-                            let frozen = freeze_regular_files(paths);
+                            let frozen = freeze_paths(paths, max_entries);
                             if let Ok(mut current) = files.lock() {
                                 *current = (!frozen.is_empty()).then_some(frozen.clone());
                             }
@@ -97,27 +102,174 @@ impl Drop for FileWorker {
     }
 }
 
+#[cfg(test)]
 pub(super) fn freeze_regular_files(paths: Vec<PathBuf>) -> Vec<FrozenFile> {
-    paths.into_iter().filter_map(|path| {
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => { tracing::debug!(?path, "Clipboard: skipping non-regular file"); return None; }
-            Err(error) => { tracing::warn!(?path, %error, "Clipboard: cannot stat selected file"); return None; }
-        };
-        let name = match path.file_name().and_then(|name| name.to_str()) {
-            Some(name) => name.to_owned(),
-            None => { tracing::warn!(?path, "Clipboard: skipping non-Unicode filename until name translation is enabled"); return None; }
-        };
-        Some(FrozenFile {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            descriptor: FileDescriptor::new(name)
-                .with_attributes(ClipboardFileAttributes::NORMAL)
-                .with_last_write_time(filetime(metadata.modified().ok()))
-                .with_file_size(metadata.len()),
+    freeze_paths(paths, MAX_FILE_COUNT)
+}
+
+pub(super) fn freeze_paths(paths: Vec<PathBuf>, max_entries: usize) -> Vec<FrozenFile> {
+    let mut files = Vec::new();
+    let mut visited_directories = HashSet::new();
+
+    for path in paths {
+        freeze_path(
+            &path,
+            &[],
+            0,
+            max_entries,
+            &mut visited_directories,
+            &mut files,
+        );
+        if files.len() == max_entries {
+            tracing::warn!(
+                max_entries,
+                "Clipboard: file selection truncated at entry limit"
+            );
+            break;
+        }
+    }
+
+    files
+}
+
+fn freeze_path(
+    path: &PathBuf,
+    parent: &[String],
+    depth: usize,
+    max_entries: usize,
+    visited_directories: &mut HashSet<(u64, u64)>,
+    files: &mut Vec<FrozenFile>,
+) {
+    if files.len() == max_entries {
+        return;
+    }
+    if depth > MAX_DIRECTORY_DEPTH {
+        tracing::warn!(
+            ?path,
+            max_depth = MAX_DIRECTORY_DEPTH,
+            "Clipboard: skipping directory beyond recursion limit"
+        );
+        return;
+    }
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(?path, %error, "Clipboard: cannot stat selected entry");
+            return;
+        }
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        tracing::warn!(
+            ?path,
+            "Clipboard: skipping non-Unicode filename until name translation is enabled"
+        );
+        return;
+    };
+    let name = name.to_owned();
+
+    if metadata.is_file() {
+        files.push(frozen_file(
+            path.clone(),
+            parent,
+            name,
+            metadata,
+            ClipboardFileAttributes::NORMAL,
+        ));
+        return;
+    }
+    if !metadata.is_dir() {
+        tracing::warn!(?path, "Clipboard: skipping non-regular clipboard entry");
+        return;
+    }
+
+    if !visited_directories.insert((metadata.dev(), metadata.ino())) {
+        tracing::warn!(?path, "Clipboard: skipping directory symlink cycle");
+        return;
+    }
+
+    files.push(frozen_file(
+        path.clone(),
+        parent,
+        name.clone(),
+        metadata,
+        ClipboardFileAttributes::DIRECTORY,
+    ));
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(?path, %error, "Clipboard: cannot enumerate directory");
+            return;
+        }
+    };
+    let mut children: Vec<_> = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry.path()),
+            Err(error) => {
+                tracing::warn!(?path, %error, "Clipboard: cannot read directory entry");
+                None
+            }
         })
-    }).collect()
+        .collect();
+    children.sort();
+    let mut relative_path = parent.to_vec();
+    relative_path.push(name);
+
+    for child in children
+        .iter()
+        .filter(|child| std::fs::metadata(child).is_ok_and(|metadata| metadata.is_dir()))
+    {
+        freeze_path(
+            child,
+            &relative_path,
+            depth + 1,
+            max_entries,
+            visited_directories,
+            files,
+        );
+        if files.len() == max_entries {
+            return;
+        }
+    }
+    for child in children
+        .iter()
+        .filter(|child| std::fs::metadata(child).is_ok_and(|metadata| !metadata.is_dir()))
+    {
+        freeze_path(
+            child,
+            &relative_path,
+            depth + 1,
+            max_entries,
+            visited_directories,
+            files,
+        );
+        if files.len() == max_entries {
+            return;
+        }
+    }
+}
+
+fn frozen_file(
+    path: PathBuf,
+    parent: &[String],
+    name: String,
+    metadata: std::fs::Metadata,
+    attributes: ClipboardFileAttributes,
+) -> FrozenFile {
+    let mut descriptor = FileDescriptor::new(name)
+        .with_attributes(attributes)
+        .with_last_write_time(filetime(metadata.modified().ok()))
+        .with_file_size(metadata.len());
+    if !parent.is_empty() {
+        descriptor = descriptor.with_relative_path(parent.join("\\"));
+    }
+    FrozenFile {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        descriptor,
+    }
 }
 
 fn filetime(modified: Option<SystemTime>) -> u64 {

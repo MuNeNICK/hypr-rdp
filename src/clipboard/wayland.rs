@@ -448,11 +448,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                         }
                         if state.file_transfer_enabled && !paths.is_empty() {
                             if let Some(worker) = &state.file_worker_sender {
-                                // This tracer intentionally freezes one regular file. Folder
-                                // traversal and multiple selections arrive in the next slice.
-                                let _ = worker.send(FileWorkerCommand::Freeze(
-                                    paths.into_iter().take(1).collect(),
-                                ));
+                                let _ = worker.send(FileWorkerCommand::Freeze(paths));
                             }
                         } else if text_mime.is_none() && !uri_list.is_empty() {
                             // URI lists without file entries remain ordinary text clipboard data.
