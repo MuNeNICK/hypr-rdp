@@ -3,9 +3,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 #[cfg(test)]
@@ -22,6 +23,21 @@ pub(super) const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
 pub(super) const MAX_DIRECTORY_DEPTH: usize = 128;
 /// The length a `SIZE` request must ask for: the answer is a single 64-bit value.
 const SIZE_RESPONSE_BYTES: u32 = 8;
+
+/// How many read requests may wait for the worker at once.
+///
+/// A client that asks faster than the filesystem answers is refused the excess
+/// rather than allowed to grow this queue without limit. Selections do not queue
+/// here — they wait in a single latest-wins slot — so this depth is entirely the
+/// client's read backlog.
+const READ_QUEUE_DEPTH: usize = 64;
+
+/// How long teardown waits for the worker before abandoning it.
+///
+/// A worker parked in a read on a filesystem that has stopped answering — a dead
+/// network mount, or this server's own remote-files mount after the client is
+/// gone — must not hold up the end of a session.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub(super) struct FrozenFile {
@@ -55,18 +71,87 @@ pub(super) fn clear_selection(files: &FrozenFiles) {
     }
 }
 
-pub(super) enum FileWorkerCommand {
-    Freeze {
-        paths: Vec<PathBuf>,
-        generation: u64,
-    },
+enum FileWorkerCommand {
+    /// Look at the selection slot and the stop flag. Carries nothing, because
+    /// what it announces is state: a wake lost to a full queue costs a turn of
+    /// the loop, not the announcement.
+    Wake,
     Read(FileContentsRequest),
-    Stop,
 }
 
+struct PendingSelection {
+    paths: Vec<PathBuf>,
+    generation: u64,
+}
+
+/// A cloneable way to reach one session's file worker.
+///
+/// Reads queue, and are refused once the queue is full: the caller is the RDP
+/// callback, and blocking it stalls video, audio and input, which is the whole
+/// reason this worker exists. Selections do not queue at all — the newest one
+/// replaces whatever has not been started, because a new selection invalidates
+/// the reads queued against the old one.
+#[derive(Clone)]
+pub(super) struct FileWorkerHandle {
+    commands: mpsc::SyncSender<FileWorkerCommand>,
+    selection: Arc<Mutex<Option<PendingSelection>>>,
+    events: UnboundedSender<ServerEvent>,
+}
+
+impl FileWorkerHandle {
+    /// Queue a read, or answer it as a protocol failure when the queue is full.
+    /// Never blocks.
+    fn read(&self, request: FileContentsRequest) {
+        let stream_id = request.stream_id;
+        if self
+            .commands
+            .try_send(FileWorkerCommand::Read(request))
+            .is_ok()
+        {
+            return;
+        }
+        tracing::warn!(
+            depth = READ_QUEUE_DEPTH,
+            "Clipboard: refusing a file read; the worker is behind"
+        );
+        let _ = self.events.send(ServerEvent::Clipboard(
+            ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(stream_id)),
+        ));
+    }
+
+    /// Hand the worker a selection to freeze, replacing one it has not started.
+    /// Returns `false` only when the worker is gone.
+    pub(super) fn freeze(&self, paths: Vec<PathBuf>, generation: u64) -> bool {
+        let Ok(mut slot) = self.selection.lock() else {
+            return false;
+        };
+        *slot = Some(PendingSelection { paths, generation });
+        drop(slot);
+        match self.commands.try_send(FileWorkerCommand::Wake) {
+            // A full queue means the worker is mid-command and will look at the
+            // slot on its next turn, so a lost wake delays the announcement
+            // rather than losing it.
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("Clipboard: file worker is gone; offering the selection as text");
+                false
+            }
+        }
+    }
+}
+
+fn take_selection(slot: &Mutex<Option<PendingSelection>>) -> Option<PendingSelection> {
+    slot.lock().ok()?.take()
+}
+
+/// One session's file worker: the thread that walks the filesystem and reads
+/// from it, so that neither happens on the Wayland event thread or inside an
+/// RDP callback.
 pub(super) struct FileWorker {
-    sender: mpsc::Sender<FileWorkerCommand>,
-    handle: Option<thread::JoinHandle<()>>,
+    handle: FileWorkerHandle,
+    stopping: Arc<AtomicBool>,
+    finished: mpsc::Receiver<()>,
+    stop_timeout: Duration,
 }
 
 impl FileWorker {
@@ -76,39 +161,78 @@ impl FileWorker {
         max_chunk_bytes: u32,
         max_entries: usize,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let handle = thread::Builder::new()
+        Self::start_with(
+            files,
+            event_sender,
+            max_entries,
+            WORKER_STOP_TIMEOUT,
+            move |files, request| read_file_contents(files, request, max_chunk_bytes),
+        )
+    }
+
+    /// [`start`](Self::start) with the read step and the teardown bound
+    /// supplied, which is how a test drives a read that never returns without
+    /// waiting the production timeout for it.
+    fn start_with(
+        files: FrozenFiles,
+        event_sender: UnboundedSender<ServerEvent>,
+        max_entries: usize,
+        stop_timeout: Duration,
+        read: impl Fn(&FrozenFiles, FileContentsRequest) -> FileContentsResponse<'static>
+            + Send
+            + 'static,
+    ) -> Self {
+        let (commands, receiver) = mpsc::sync_channel(READ_QUEUE_DEPTH);
+        let (finished_sender, finished) = mpsc::channel();
+        let handle = FileWorkerHandle {
+            commands,
+            selection: Arc::default(),
+            events: event_sender.clone(),
+        };
+        let stopping = Arc::new(AtomicBool::new(false));
+        // The thread holds the slot, not a handle: a handle of its own would
+        // keep the command channel alive and hide the worker's own shutdown.
+        let selection = Arc::clone(&handle.selection);
+        let flag = Arc::clone(&stopping);
+        thread::Builder::new()
             .name("clipboard-file-worker".into())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
-                    match command {
-                        FileWorkerCommand::Freeze { paths, generation } => {
-                            let frozen = freeze_paths(paths, max_entries);
-                            publish_selection(&files, generation, frozen, &event_sender);
-                        }
-                        FileWorkerCommand::Read(request) => {
-                            let response = read_file_contents(&files, request, max_chunk_bytes);
+                while !flag.load(Ordering::Relaxed) {
+                    // A newer selection invalidates the reads queued behind it,
+                    // so it is taken before them.
+                    if let Some(pending) = take_selection(&selection) {
+                        let frozen = freeze_paths(pending.paths, max_entries);
+                        publish_selection(&files, pending.generation, frozen, &event_sender);
+                        continue;
+                    }
+                    match receiver.recv() {
+                        Ok(FileWorkerCommand::Wake) => continue,
+                        Ok(FileWorkerCommand::Read(request)) => {
+                            let response = read(&files, request);
                             let _ = event_sender.send(ServerEvent::Clipboard(
                                 ClipboardMessage::SendFileContentsResponse(response),
                             ));
                         }
-                        FileWorkerCommand::Stop => break,
+                        Err(_) => break,
                     }
                 }
+                let _ = finished_sender.send(());
             })
             .expect("spawn clipboard file worker");
         Self {
-            sender,
-            handle: Some(handle),
+            handle,
+            stopping,
+            finished,
+            stop_timeout,
         }
     }
 
-    pub(super) fn send(&self, command: FileWorkerCommand) {
-        let _ = self.sender.send(command);
+    pub(super) fn read(&self, request: FileContentsRequest) {
+        self.handle.read(request);
     }
 
-    pub(super) fn sender(&self) -> mpsc::Sender<FileWorkerCommand> {
-        self.sender.clone()
+    pub(super) fn handle(&self) -> FileWorkerHandle {
+        self.handle.clone()
     }
 }
 
@@ -135,9 +259,18 @@ fn publish_selection(
 
 impl Drop for FileWorker {
     fn drop(&mut self) {
-        self.send(FileWorkerCommand::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        // A flag rather than a queued command: a stop message would sit behind
+        // every read already queued, so teardown would first serve the backlog.
+        self.stopping.store(true, Ordering::Relaxed);
+        // Wake a worker parked on an empty queue. Best effort: a full queue
+        // means it is mid-command and will see the flag on its next turn.
+        let _ = self.handle.commands.try_send(FileWorkerCommand::Wake);
+        if let Err(mpsc::RecvTimeoutError::Timeout) = self.finished.recv_timeout(self.stop_timeout)
+        {
+            // Abandoning keeps the frozen entries alive until the read returns,
+            // which costs one session's worth of memory on a path only a wedged
+            // filesystem reaches. Waiting instead costs the session's teardown.
+            tracing::warn!("Clipboard: abandoning the file worker; a read has not returned");
         }
     }
 }
@@ -149,14 +282,11 @@ impl Drop for FileWorker {
 /// server-to-client file transfer is off.
 pub(super) struct FileSelection {
     frozen: FrozenFiles,
-    worker: Option<mpsc::Sender<FileWorkerCommand>>,
+    worker: Option<FileWorkerHandle>,
 }
 
 impl FileSelection {
-    pub(super) fn new(
-        frozen: FrozenFiles,
-        worker: Option<mpsc::Sender<FileWorkerCommand>>,
-    ) -> Self {
+    pub(super) fn new(frozen: FrozenFiles, worker: Option<FileWorkerHandle>) -> Self {
         Self { frozen, worker }
     }
 
@@ -179,11 +309,8 @@ impl FileSelection {
         current.generation = current.generation.wrapping_add(1);
         current.entries = None;
         let generation = current.generation;
-        if let Err(error) = worker.send(FileWorkerCommand::Freeze { paths, generation }) {
-            tracing::warn!(%error, "Clipboard: file worker is gone; offering the selection as text");
-            return false;
-        }
-        true
+        drop(current);
+        worker.freeze(paths, generation)
     }
 }
 
@@ -619,6 +746,8 @@ pub(super) fn uri_list_paths(data: &[u8]) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use std::io::Write;
 
@@ -709,13 +838,13 @@ mod tests {
         std::fs::write(&path, b"old selection").unwrap();
         for newer_freeze in [false, true] {
             let files: FrozenFiles = Arc::default();
-            let (sender, commands) = mpsc::channel();
-            let selection = FileSelection::new(files.clone(), Some(sender));
+            let (handle, commands, _) = test_handle();
+            let selection = FileSelection::new(files.clone(), Some(handle.clone()));
             assert!(selection.freeze(vec![path.clone()]));
-            let FileWorkerCommand::Freeze { paths, generation } = commands.recv().unwrap() else {
-                panic!()
-            };
-            let result = freeze_paths(paths, 100);
+            assert!(matches!(commands.recv().unwrap(), FileWorkerCommand::Wake));
+            let pending = take_selection(&handle.selection).expect("the selection to freeze");
+            let generation = pending.generation;
+            let result = freeze_paths(pending.paths, 100);
             if newer_freeze {
                 assert!(selection.freeze(vec![path.clone()]));
             } else {
@@ -730,6 +859,97 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A handle whose worker is the test itself: the commands it queues and the
+    /// selections it parks are inspected rather than served.
+    fn test_handle() -> (
+        FileWorkerHandle,
+        mpsc::Receiver<FileWorkerCommand>,
+        tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    ) {
+        let (commands, receiver) = mpsc::sync_channel(READ_QUEUE_DEPTH);
+        let (events, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            FileWorkerHandle {
+                commands,
+                selection: Arc::default(),
+                events,
+            },
+            receiver,
+            event_receiver,
+        )
+    }
+
+    fn range_request() -> FileContentsRequest {
+        request(0, FileContentsFlags::RANGE, 0, 8)
+    }
+
+    #[test]
+    fn a_read_arriving_at_a_full_queue_is_refused_rather_than_waited_on() {
+        let (handle, commands, mut events) = test_handle();
+        // Nothing drains the queue, so it fills to the depth it was built with.
+        for _ in 0..READ_QUEUE_DEPTH {
+            handle.read(range_request());
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "a queued read was answered before the worker ran"
+        );
+
+        handle.read(range_request());
+
+        let Ok(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsResponse(response))) =
+            events.try_recv()
+        else {
+            panic!("expected the refused read to be answered");
+        };
+        assert!(response.is_error());
+        assert_eq!(commands.try_iter().count(), READ_QUEUE_DEPTH);
+    }
+
+    #[test]
+    fn teardown_does_not_wait_for_a_read_that_never_returns() {
+        let stop_timeout = Duration::from_millis(200);
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let (started, read_started) = mpsc::channel();
+        // Held for the life of the test, so the read the worker starts never
+        // completes on its own.
+        let (_never, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let worker = FileWorker::start_with(
+            Arc::default(),
+            events,
+            100,
+            stop_timeout,
+            move |_, request| {
+                let _ = started.send(());
+                let _ = blocked.lock().expect("the blocked read").recv();
+                FileContentsResponse::new_error(request.stream_id)
+            },
+        );
+
+        worker.read(range_request());
+        read_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker to start the read");
+        // A backlog teardown must not serve before it stops.
+        for _ in 0..8 {
+            worker.read(range_request());
+        }
+
+        let teardown = Instant::now();
+        drop(worker);
+        let elapsed = teardown.elapsed();
+
+        assert!(
+            elapsed >= stop_timeout,
+            "teardown returned before the bound, so it did not wait for the worker at all"
+        );
+        assert!(
+            elapsed < stop_timeout * 10,
+            "teardown waited on a read that never returns: {elapsed:?}"
+        );
     }
 
     fn request(
@@ -828,17 +1048,18 @@ mod tests {
     #[test]
     fn freezes_a_selection_only_when_transfer_is_on_and_paths_remain() {
         let frozen: FrozenFiles = Arc::new(Mutex::new(Some(Vec::new()).into()));
-        let (sender, receiver) = mpsc::channel();
-        let selection = FileSelection::new(Arc::clone(&frozen), Some(sender));
+        let (handle, commands, _) = test_handle();
+        let selection = FileSelection::new(Arc::clone(&frozen), Some(handle.clone()));
 
         selection.clear();
         assert!(frozen.lock().unwrap().entries.is_none());
         assert!(!selection.freeze(Vec::new()));
         assert!(selection.freeze(vec![PathBuf::from("/nonexistent")]));
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(FileWorkerCommand::Freeze { paths, .. }) if paths == [PathBuf::from("/nonexistent")]
-        ));
+        assert!(matches!(commands.try_recv(), Ok(FileWorkerCommand::Wake)));
+        assert_eq!(
+            take_selection(&handle.selection).expect("the selection to freeze").paths,
+            [PathBuf::from("/nonexistent")]
+        );
 
         let disabled = FileSelection::new(Arc::clone(&frozen), None);
         assert!(!disabled.freeze(vec![PathBuf::from("/nonexistent")]));

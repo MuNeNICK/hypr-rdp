@@ -15,7 +15,7 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::files::{clear_selection, FileSelection, FileWorker, FileWorkerCommand, FrozenFiles};
+use super::files::{clear_selection, FileSelection, FileWorker, FrozenFiles};
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
@@ -372,7 +372,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
         if let Some(worker) = self.to_client_worker() {
-            worker.send(FileWorkerCommand::Read(request));
+            worker.read(request);
             return;
         }
         if let Some(sender) = &self.event_sender {
@@ -631,7 +631,7 @@ impl HyprCliprdrBackend {
             echo_candidate: Arc::clone(&self.echo_candidate),
             file_selection: FileSelection::new(
                 Arc::clone(&self.files),
-                self.to_client_worker().map(|worker| worker.sender()),
+                self.to_client_worker().map(|worker| worker.handle()),
             ),
             remote_files: self.remote_files.clone(),
         };
@@ -1092,10 +1092,7 @@ mod tests {
             1024,
             10,
         );
-        worker.send(FileWorkerCommand::Freeze {
-            paths: vec![root.clone()],
-            generation: 0,
-        });
+        assert!(worker.handle().freeze(vec![root.clone()], 0));
 
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
@@ -1152,10 +1149,7 @@ mod tests {
             1024,
             3,
         );
-        worker.send(FileWorkerCommand::Freeze {
-            paths: vec![root.clone()],
-            generation: 0,
-        });
+        assert!(worker.handle().freeze(vec![root.clone()], 0));
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
         else {
