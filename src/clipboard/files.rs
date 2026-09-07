@@ -20,6 +20,8 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Seconds between the FILETIME epoch (1601) and the Unix epoch.
 pub(super) const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
 pub(super) const MAX_DIRECTORY_DEPTH: usize = 128;
+/// The length a `SIZE` request must ask for: the answer is a single 64-bit value.
+const SIZE_RESPONSE_BYTES: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub(super) struct FrozenFile {
@@ -494,6 +496,59 @@ fn open_source(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// The single operation a well-formed file-contents request describes.
+enum RequestedOperation {
+    Size,
+    Range { position: u64, length: u32 },
+}
+
+/// The one operation a request asks for, or `None` if it asks for no operation
+/// the protocol allows.
+///
+/// MS-RDPECLIP lets a request describe exactly one operation: `SIZE` and `RANGE`
+/// are mutually exclusive, and a `SIZE` request must ask for eight bytes at
+/// position zero, because the answer is a single 64-bit value. Anything else is
+/// refused rather than interpreted, which is why this is a lookup and not a pair
+/// of flag tests at the point of use.
+///
+/// Bits outside those two are reserved, and the protocol library preserves them
+/// through decoding rather than masking them off. An unknown bit is therefore
+/// logged and ignored: refusing one would refuse a client that sets a bit this
+/// implementation has not seen, and a refused request costs the user a paste.
+fn requested_operation(request: &FileContentsRequest) -> Option<RequestedOperation> {
+    let reserved = request
+        .flags
+        .difference(FileContentsFlags::SIZE | FileContentsFlags::RANGE);
+    if !reserved.is_empty() {
+        tracing::debug!(
+            flags = format!("{:#x}", request.flags.bits()),
+            "Clipboard: ignoring reserved flags on a file-contents request"
+        );
+    }
+    let operation = match (
+        request.flags.contains(FileContentsFlags::SIZE),
+        request.flags.contains(FileContentsFlags::RANGE),
+    ) {
+        (true, false) if request.position == 0 && request.requested_size == SIZE_RESPONSE_BYTES => {
+            Some(RequestedOperation::Size)
+        }
+        (false, true) => Some(RequestedOperation::Range {
+            position: request.position,
+            length: request.requested_size,
+        }),
+        _ => None,
+    };
+    if operation.is_none() {
+        tracing::warn!(
+            flags = format!("{:#x}", request.flags.bits()),
+            position = request.position,
+            requested_size = request.requested_size,
+            "Clipboard: refusing a file-contents request the protocol does not allow"
+        );
+    }
+    operation
+}
+
 fn read_file_contents_with_open(
     files: &FrozenFiles,
     request: FileContentsRequest,
@@ -501,6 +556,10 @@ fn read_file_contents_with_open(
     open: impl FnOnce(&Path) -> std::io::Result<File>,
 ) -> FileContentsResponse<'static> {
     let error = || FileContentsResponse::new_error(request.stream_id);
+    // Refuse a malformed request before it reaches the filesystem.
+    let Some(operation) = requested_operation(&request) else {
+        return error();
+    };
     let Some(file) = files.lock().ok().and_then(|files| {
         files
             .entries
@@ -519,23 +578,28 @@ fn read_file_contents_with_open(
     if metadata.dev() != file.device || metadata.ino() != file.inode || !metadata.is_file() {
         return error();
     }
-    if request.flags.contains(FileContentsFlags::SIZE) {
-        return FileContentsResponse::new_size_response(request.stream_id, metadata.len());
-    }
-    if !request.flags.contains(FileContentsFlags::RANGE) || request.requested_size > max_chunk_bytes
-    {
-        return error();
-    }
-    let mut data = vec![0; request.requested_size as usize];
-    if source.seek(SeekFrom::Start(request.position)).is_err() {
-        return error();
-    }
-    match source.read(&mut data) {
-        Ok(count) => {
-            data.truncate(count);
-            FileContentsResponse::new_data_response(request.stream_id, data)
+    match operation {
+        RequestedOperation::Size => {
+            FileContentsResponse::new_size_response(request.stream_id, metadata.len())
         }
-        Err(_) => error(),
+        RequestedOperation::Range { position, length } => {
+            // The configured ceiling, not a protocol rule: it is what keeps the
+            // client from choosing how much this server allocates.
+            if length > max_chunk_bytes {
+                return error();
+            }
+            let mut data = vec![0; length as usize];
+            if source.seek(SeekFrom::Start(position)).is_err() {
+                return error();
+            }
+            match source.read(&mut data) {
+                Ok(count) => {
+                    data.truncate(count);
+                    FileContentsResponse::new_data_response(request.stream_id, data)
+                }
+                Err(_) => error(),
+            }
+        }
     }
 }
 
@@ -699,6 +763,43 @@ mod tests {
         let range = read_file_contents(&files, request(0, FileContentsFlags::RANGE, 10, 64), 64);
         assert_eq!(range.stream_id(), 7);
         assert_eq!(range.data(), b"bytes");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_request_that_does_not_describe_one_operation() {
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-file-flags-test-{}", std::process::id()));
+        File::create(&path)
+            .unwrap()
+            .write_all(b"clipboard bytes")
+            .unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(freeze_regular_files(vec![path.clone()])).into(),
+        ));
+        // Both operations at once, and neither of them, describe no operation.
+        let both = FileContentsFlags::SIZE | FileContentsFlags::RANGE;
+        assert!(read_file_contents(&files, request(0, both, 0, 8), 64).is_error());
+        assert!(
+            read_file_contents(&files, request(0, FileContentsFlags::empty(), 0, 8), 64).is_error()
+        );
+        // A size request answers one 64-bit value, so any other position or
+        // length is not a size request.
+        assert!(
+            read_file_contents(&files, request(0, FileContentsFlags::SIZE, 1, 8), 64).is_error()
+        );
+        assert!(
+            read_file_contents(&files, request(0, FileContentsFlags::SIZE, 0, 4), 64).is_error()
+        );
+        // A reserved bit alongside one operation is ignored, not refused.
+        let reserved =
+            FileContentsFlags::from_bits_retain(FileContentsFlags::SIZE.bits() | 0x0000_0004);
+        assert_eq!(
+            read_file_contents(&files, request(0, reserved, 0, 8), 64)
+                .data_as_size()
+                .unwrap(),
+            15
+        );
         std::fs::remove_file(path).unwrap();
     }
 
