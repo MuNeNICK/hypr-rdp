@@ -14,9 +14,10 @@ use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
 use super::formats::{
-    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE,
+    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
+    MAX_CLIPBOARD_SIZE,
 };
-use super::wayland::clipboard_thread;
+use super::wayland::{clipboard_thread, ClipboardShared};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ClipboardEchoCandidate {
@@ -157,27 +158,12 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_request_format_list(&mut self) {
-        let mut formats = Vec::new();
-
-        let has_text = self
-            .clipboard_data
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|d| !d.is_empty()))
-            .unwrap_or(false);
-        if has_text {
-            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
-        }
-
-        let has_image = self
-            .clipboard_image
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|d| !d.is_empty()))
-            .unwrap_or(false);
-        if has_image {
-            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
-        }
+        let formats: Vec<ClipboardFormat> = SelectionKind::ALL
+            .into_iter()
+            .filter(|kind| self.has_local_selection(*kind))
+            .filter_map(Self::local_format_for_kind)
+            .map(ClipboardFormat::new)
+            .collect();
 
         if !formats.is_empty() {
             if let Some(ref sender) = self.event_sender {
@@ -210,26 +196,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
             .ok()
             .and_then(|mut candidate| candidate.take());
 
-        let has_unicode = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT);
-        let has_dibv5 = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_DIBV5);
-        let has_dib = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_DIB);
-
-        // Prefer text over image; prefer CF_DIBV5 over CF_DIB (better BITFIELDS support)
-        let format = if has_unicode {
-            Some(ClipboardFormatId::CF_UNICODETEXT)
-        } else if has_dibv5 {
-            Some(ClipboardFormatId::CF_DIBV5)
-        } else if has_dib {
-            Some(ClipboardFormatId::CF_DIB)
-        } else {
-            None
-        };
+        let format = SelectionKind::REMOTE_PREFERENCE
+            .into_iter()
+            .find_map(|kind| Self::remote_format_for_kind(kind, available_formats));
 
         let Some(format) = format else {
             self.last_requested_format = None;
@@ -253,25 +222,31 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        let response = if request.format == ClipboardFormatId::CF_UNICODETEXT {
-            let data = self.clipboard_data.lock().ok().and_then(|g| g.clone());
-            match data {
-                Some(ref data) if !data.is_empty() => {
-                    let text = String::from_utf8_lossy(data);
-                    FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
+        let response = match Self::local_kind_for_format(request.format) {
+            Some(SelectionKind::Text) => {
+                let data = self.clipboard_data.lock().ok().and_then(|g| g.clone());
+                match data {
+                    Some(ref data) if !data.is_empty() => {
+                        let text = String::from_utf8_lossy(data);
+                        FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
+                    }
+                    _ => FormatDataResponse::new_error().into_owned(),
                 }
-                _ => FormatDataResponse::new_error().into_owned(),
             }
-        } else if request.format == ClipboardFormatId::CF_DIB {
-            let data = self.clipboard_image.lock().ok().and_then(|g| g.clone());
-            match data {
-                Some(dib_data) if !dib_data.is_empty() => {
-                    FormatDataResponse::new_data(dib_data).into_owned()
+            Some(SelectionKind::Image) => {
+                let data = self.clipboard_image.lock().ok().and_then(|g| g.clone());
+                match data {
+                    Some(dib_data) if !dib_data.is_empty() => {
+                        FormatDataResponse::new_data(dib_data).into_owned()
+                    }
+                    _ => FormatDataResponse::new_error().into_owned(),
                 }
-                _ => FormatDataResponse::new_error().into_owned(),
             }
-        } else {
-            FormatDataResponse::new_error().into_owned()
+            Some(SelectionKind::Files) => {
+                tracing::trace!("Clipboard: file selection support is not enabled yet");
+                FormatDataResponse::new_error().into_owned()
+            }
+            None => FormatDataResponse::new_error().into_owned(),
         };
 
         if let Some(ref sender) = self.event_sender {
@@ -295,6 +270,60 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    fn has_local_selection(&self, kind: SelectionKind) -> bool {
+        match kind {
+            SelectionKind::Text => self
+                .clipboard_data
+                .lock()
+                .ok()
+                .and_then(|data| data.as_ref().map(|data| !data.is_empty()))
+                .unwrap_or(false),
+            SelectionKind::Image => self
+                .clipboard_image
+                .lock()
+                .ok()
+                .and_then(|data| data.as_ref().map(|data| !data.is_empty()))
+                .unwrap_or(false),
+            // No file selection is read from the desktop yet.
+            SelectionKind::Files => false,
+        }
+    }
+
+    fn local_format_for_kind(kind: SelectionKind) -> Option<ClipboardFormatId> {
+        match kind {
+            SelectionKind::Text => Some(ClipboardFormatId::CF_UNICODETEXT),
+            SelectionKind::Image => Some(ClipboardFormatId::CF_DIB),
+            SelectionKind::Files => None,
+        }
+    }
+
+    fn local_kind_for_format(format: ClipboardFormatId) -> Option<SelectionKind> {
+        match format {
+            ClipboardFormatId::CF_UNICODETEXT => Some(SelectionKind::Text),
+            ClipboardFormatId::CF_DIB => Some(SelectionKind::Image),
+            _ => None,
+        }
+    }
+
+    fn remote_format_for_kind(
+        kind: SelectionKind,
+        formats: &[ClipboardFormat],
+    ) -> Option<ClipboardFormatId> {
+        let has_format = |id| formats.iter().any(|format| format.id == id);
+        match kind {
+            SelectionKind::Text => has_format(ClipboardFormatId::CF_UNICODETEXT)
+                .then_some(ClipboardFormatId::CF_UNICODETEXT),
+            SelectionKind::Image => {
+                if has_format(ClipboardFormatId::CF_DIBV5) {
+                    Some(ClipboardFormatId::CF_DIBV5)
+                } else {
+                    has_format(ClipboardFormatId::CF_DIB).then_some(ClipboardFormatId::CF_DIB)
+                }
+            }
+            SelectionKind::Files => None,
+        }
+    }
+
     fn handle_format_data_response(
         &mut self,
         response: FormatDataResponse<'_>,
@@ -405,23 +434,19 @@ impl HyprCliprdrBackend {
             None => return,
         };
 
-        let clipboard_data = Arc::clone(&self.clipboard_data);
-        let clipboard_image = Arc::clone(&self.clipboard_image);
-        let pending_write = Arc::clone(&self.pending_write);
-        let echo_candidate = Arc::clone(&self.echo_candidate);
         let running = Arc::clone(&self.running);
+        let shared = ClipboardShared {
+            event_sender: sender,
+            clipboard_data: Arc::clone(&self.clipboard_data),
+            clipboard_image: Arc::clone(&self.clipboard_image),
+            pending_write: Arc::clone(&self.pending_write),
+            echo_candidate: Arc::clone(&self.echo_candidate),
+        };
 
         match thread::Builder::new()
             .name("clipboard-watcher".into())
             .spawn(move || {
-                if let Err(e) = clipboard_thread(
-                    sender,
-                    clipboard_data,
-                    clipboard_image,
-                    pending_write,
-                    echo_candidate,
-                    running,
-                ) {
+                if let Err(e) = clipboard_thread(shared, running) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
             }) {

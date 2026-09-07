@@ -17,7 +17,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::formats::{
-    PendingWrite, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
+    PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
+    UTF8_MIME,
 };
 
 const DATA_CONTROL_VERSION: u32 = 1;
@@ -26,12 +27,17 @@ fn data_control_manager_version(advertised_version: u32) -> u32 {
     advertised_version.min(DATA_CONTROL_VERSION)
 }
 
+/// Clipboard state the backend shares with the watcher thread.
+pub(super) struct ClipboardShared {
+    pub(super) event_sender: mpsc::UnboundedSender<ServerEvent>,
+    pub(super) clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
+    pub(super) clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
+    pub(super) pending_write: Arc<Mutex<Option<PendingWrite>>>,
+    pub(super) echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+}
+
 pub(super) fn clipboard_thread(
-    event_sender: mpsc::UnboundedSender<ServerEvent>,
-    clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
-    clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
-    pending_write: Arc<Mutex<Option<PendingWrite>>>,
-    echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    shared: ClipboardShared,
     running: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
@@ -42,13 +48,7 @@ pub(super) fn clipboard_thread(
     let display = conn.display();
     let _registry = display.get_registry(&qh, ());
 
-    let mut state = ClipState::new(
-        event_sender,
-        clipboard_data,
-        clipboard_image,
-        pending_write,
-        echo_candidate,
-    );
+    let mut state = ClipState::new(shared);
 
     let wayland_fd = conn.as_fd().as_raw_fd();
     let ready = dispatch_until_globals_ready(
@@ -113,24 +113,16 @@ pub(super) fn clipboard_thread(
                     source.offer(TEXT_MIME.to_string());
                     source.offer(UTF8_MIME.to_string());
                     source.offer(TEXT_PLAIN_MIME.to_string());
-                    if let Ok(mut g) = state.source_data.lock() {
-                        *g = Some(data.clone());
-                    }
-                    if let Ok(mut g) = state.source_mime.lock() {
-                        *g = SourceType::Text;
-                    }
                 }
                 PendingWrite::Image(data) => {
                     tracing::trace!(len = data.len(), "Clipboard: writing image to Wayland");
                     source.offer(IMAGE_PNG_MIME.to_string());
-                    if let Ok(mut g) = state.source_data.lock() {
-                        *g = Some(data.clone());
-                    }
-                    if let Ok(mut g) = state.source_mime.lock() {
-                        *g = SourceType::Image;
-                    }
                 }
             }
+            state.active_selection = Some(ActiveSelection {
+                kind: pending.kind(),
+                pending,
+            });
 
             if let Some(dev) = state.device.as_ref() {
                 dev.set_selection(Some(&source));
@@ -159,12 +151,6 @@ pub(super) fn clipboard_thread(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum SourceType {
-    Text,
-    Image,
-}
-
 struct ClipState {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     /// Deadline for Selection events caused by our own write.
@@ -177,34 +163,42 @@ struct ClipState {
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
     offer_mimes: HashMap<ObjectId, Vec<String>>,
-    source_data: Arc<Mutex<Option<Vec<u8>>>>,
-    source_mime: Arc<Mutex<SourceType>>,
+    active_selection: Option<ActiveSelection>,
     /// Currently active data source; destroyed when replaced to avoid protocol object leak.
     active_source: Option<zwlr_data_control_source_v1::ZwlrDataControlSourceV1>,
 }
 
+struct ActiveSelection {
+    kind: SelectionKind,
+    pending: PendingWrite,
+}
+
 impl ClipState {
-    fn new(
-        event_sender: mpsc::UnboundedSender<ServerEvent>,
-        clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
-        clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
-        pending_write: Arc<Mutex<Option<PendingWrite>>>,
-        echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
-    ) -> Self {
+    fn new(shared: ClipboardShared) -> Self {
         Self {
-            event_sender,
+            event_sender: shared.event_sender,
             suppress_echo_until: None,
-            clipboard_data,
-            clipboard_image,
-            pending_write,
-            echo_candidate,
+            clipboard_data: shared.clipboard_data,
+            clipboard_image: shared.clipboard_image,
+            pending_write: shared.pending_write,
+            echo_candidate: shared.echo_candidate,
             manager: None,
             seat: None,
             device: None,
             offer_mimes: HashMap::new(),
-            source_data: Arc::new(Mutex::new(None)),
-            source_mime: Arc::new(Mutex::new(SourceType::Text)),
+            active_selection: None,
             active_source: None,
+        }
+    }
+
+    /// Forget every cached format, so nothing from the previous selection stays
+    /// advertisable after the compositor has replaced it.
+    fn clear_cached_selection(&self) {
+        if let Ok(mut data) = self.clipboard_data.lock() {
+            *data = None;
+        }
+        if let Ok(mut image) = self.clipboard_image.lock() {
+            *image = None;
         }
     }
 
@@ -333,12 +327,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 let offer = match id {
                     Some(offer) => offer,
                     None => {
-                        if let Ok(mut g) = state.clipboard_data.lock() {
-                            *g = None;
-                        }
-                        if let Ok(mut g) = state.clipboard_image.lock() {
-                            *g = None;
-                        }
+                        state.clear_cached_selection();
                         return;
                     }
                 };
@@ -353,25 +342,12 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 };
 
-                let text_mime = mimes
-                    .iter()
-                    .find(|m| {
-                        m.as_str() == TEXT_MIME
-                            || m.as_str() == UTF8_MIME
-                            || m.as_str() == TEXT_PLAIN_MIME
-                    })
-                    .cloned();
-
-                let image_mime = mimes.iter().find(|m| m.as_str() == IMAGE_PNG_MIME).cloned();
+                let text_mime = SelectionKind::Text.offered_wayland_mime(&mimes);
+                let image_mime = SelectionKind::Image.offered_wayland_mime(&mimes);
 
                 if text_mime.is_none() && image_mime.is_none() {
                     // No supported MIME — clear stale caches
-                    if let Ok(mut g) = state.clipboard_data.lock() {
-                        *g = None;
-                    }
-                    if let Ok(mut g) = state.clipboard_image.lock() {
-                        *g = None;
-                    }
+                    state.clear_cached_selection();
                     offer.destroy();
                     return;
                 }
@@ -708,22 +684,21 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                let is_text_mime = mime_type == TEXT_MIME
-                    || mime_type == UTF8_MIME
-                    || mime_type == TEXT_PLAIN_MIME;
-                let is_image_mime = mime_type == IMAGE_PNG_MIME;
+                let selection = state.active_selection.as_ref();
 
-                let source_type = state.source_mime.lock().ok().map(|g| *g);
-
-                let should_send = match source_type {
-                    Some(SourceType::Text) => is_text_mime,
-                    Some(SourceType::Image) => is_image_mime,
-                    None => is_text_mime,
+                let should_send = match selection {
+                    Some(selection) => selection.kind.accepts_wayland_mime(&mime_type),
+                    None => {
+                        tracing::debug!(%mime_type, "Clipboard: ignoring send without selection kind");
+                        false
+                    }
                 };
 
                 if should_send {
-                    if let Some(data) = state.source_data.lock().ok().and_then(|g| g.clone()) {
-                        write_source_data(&fd, &data);
+                    if let Some(selection) = selection {
+                        if let Some(data) = selection.pending.data_for_mime(&mime_type) {
+                            write_source_data(&fd, data);
+                        }
                     }
                 }
             }
@@ -736,6 +711,7 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
                     .is_some_and(|s| s.id() == proxy.id())
                 {
                     state.active_source = None;
+                    state.active_selection = None;
                 }
             }
             _ => {}
@@ -767,13 +743,13 @@ mod tests {
 
     fn clip_state() -> ClipState {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        ClipState::new(
-            event_tx,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-        )
+        ClipState::new(ClipboardShared {
+            event_sender: event_tx,
+            clipboard_data: Arc::new(Mutex::new(None)),
+            clipboard_image: Arc::new(Mutex::new(None)),
+            pending_write: Arc::new(Mutex::new(None)),
+            echo_candidate: Arc::new(Mutex::new(None)),
+        })
     }
 
     #[test]

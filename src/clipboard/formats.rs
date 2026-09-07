@@ -4,6 +4,42 @@ pub(super) const TEXT_MIME: &str = "text/plain;charset=utf-8";
 pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
+pub(super) const FILE_URI_LIST_MIME: &str = "text/uri-list";
+pub(super) const GNOME_COPIED_FILES_MIME: &str = "x-special/gnome-copied-files";
+
+/// The kind of content carried by a clipboard selection.
+///
+/// A selection may advertise more than one representation, but every
+/// representation belongs to one of these kinds. Keep this list exhaustive so
+/// adding a new selection kind cannot accidentally fall through text/image
+/// handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelectionKind {
+    Text,
+    Image,
+    Files,
+}
+
+impl SelectionKind {
+    pub(super) const ALL: [Self; 3] = [Self::Text, Self::Image, Self::Files];
+    /// Order used when choosing one of several remote clipboard formats.
+    pub(super) const REMOTE_PREFERENCE: [Self; 3] = [Self::Text, Self::Image, Self::Files];
+
+    pub(super) fn accepts_wayland_mime(self, mime: &str) -> bool {
+        match self {
+            Self::Text => mime == TEXT_MIME || mime == UTF8_MIME || mime == TEXT_PLAIN_MIME,
+            Self::Image => mime == IMAGE_PNG_MIME,
+            Self::Files => mime == FILE_URI_LIST_MIME || mime == GNOME_COPIED_FILES_MIME,
+        }
+    }
+
+    pub(super) fn offered_wayland_mime(self, mimes: &[String]) -> Option<String> {
+        mimes
+            .iter()
+            .find(|mime| self.accepts_wayland_mime(mime))
+            .cloned()
+    }
+}
 
 /// Normalize CR, LF, and CRLF line endings to Wayland's LF form.
 pub(super) fn normalize_lf(text: &str) -> String {
@@ -61,6 +97,23 @@ pub(super) fn to_crlf(text: &str) -> String {
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
     Image(Vec<u8>), // PNG bytes
+}
+
+impl PendingWrite {
+    pub(super) fn kind(&self) -> SelectionKind {
+        match self {
+            Self::Text(_) => SelectionKind::Text,
+            Self::Image(_) => SelectionKind::Image,
+        }
+    }
+
+    pub(super) fn data_for_mime(&self, mime: &str) -> Option<&[u8]> {
+        match self {
+            Self::Text(data) if SelectionKind::Text.accepts_wayland_mime(mime) => Some(data),
+            Self::Image(data) if SelectionKind::Image.accepts_wayland_mime(mime) => Some(data),
+            _ => None,
+        }
+    }
 }
 
 /// Fix a CF_DIB with BI_BITFIELDS compression (common on Windows for 32-bit BGRA).
