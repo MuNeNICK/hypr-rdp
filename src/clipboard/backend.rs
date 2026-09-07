@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
@@ -13,11 +15,13 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
+use super::files::{clear_selection, FileSelection, FileWorker, FrozenFiles};
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
 };
 use super::wayland::{clipboard_thread, ClipboardShared};
+use crate::config::FileTransferMode;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ClipboardEchoCandidate {
@@ -71,11 +75,23 @@ pub(super) fn announce_local_formats(
 
 pub struct HyprCliprdrFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    file_transfer_mode: FileTransferMode,
+    file_transfer_max_chunk_bytes: u32,
+    file_transfer_max_entries: usize,
 }
 
 impl HyprCliprdrFactory {
-    pub fn new() -> Self {
-        Self { event_sender: None }
+    pub fn new(
+        file_transfer_mode: FileTransferMode,
+        file_transfer_max_chunk_bytes: u32,
+        file_transfer_max_entries: usize,
+    ) -> Self {
+        Self {
+            event_sender: None,
+            file_transfer_mode,
+            file_transfer_max_chunk_bytes,
+            file_transfer_max_entries,
+        }
     }
 }
 
@@ -92,7 +108,15 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
         let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
         let running = Arc::new(AtomicBool::new(true));
-
+        let files: FrozenFiles = Arc::default();
+        let file_worker = self.event_sender.as_ref().map(|sender| {
+            FileWorker::start(
+                Arc::clone(&files),
+                sender.clone(),
+                self.file_transfer_max_chunk_bytes,
+                self.file_transfer_max_entries,
+            )
+        });
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
             remote_formats: Vec::new(),
@@ -104,6 +128,9 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             running,
             last_requested_format: None,
             pending_echo_candidate: None,
+            file_transfer_mode: self.file_transfer_mode,
+            files,
+            file_worker,
         })
     }
 }
@@ -121,6 +148,9 @@ struct HyprCliprdrBackend {
     running: Arc<AtomicBool>,
     last_requested_format: Option<ClipboardFormatId>,
     pending_echo_candidate: Option<ClipboardEchoCandidate>,
+    file_transfer_mode: FileTransferMode,
+    files: FrozenFiles,
+    file_worker: Option<FileWorker>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -149,7 +179,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+        let mut capabilities = ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES;
+        if self.file_transfer_mode.permits_to_client() {
+            capabilities |= ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+                | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
+        }
+        capabilities
     }
 
     fn on_ready(&mut self) {
@@ -176,6 +212,21 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 );
             }
         }
+        if self.file_transfer_mode.permits_to_client() {
+            if let Some(files) = self
+                .files
+                .lock()
+                .ok()
+                .and_then(|files| files.entries.clone())
+            {
+                if let Some(sender) = &self.event_sender {
+                    let descriptors = files.into_iter().map(|file| file.descriptor).collect();
+                    let _ = sender.send(ServerEvent::Clipboard(
+                        ClipboardMessage::SendInitiateFileCopy(descriptors),
+                    ));
+                }
+            }
+        }
     }
 
     fn on_process_negotiated_capabilities(
@@ -190,6 +241,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
+        clear_selection(&self.files);
         let echo_candidate = self
             .echo_candidate
             .lock()
@@ -260,9 +312,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
         self.handle_format_data_response(response, MAX_CLIPBOARD_SIZE);
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        if let Some(worker) = self.to_client_worker() {
+            worker.read(request);
+            return;
+        }
+        if let Some(sender) = &self.event_sender {
+            let _ = sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(
+                    request.stream_id,
+                )),
+            ));
+        }
+    }
 
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {
+        // This server never asks the client for file contents: the direction
+        // that does is not part of this change.
+    }
 
     fn on_lock(&mut self, _data_id: LockDataId) {}
 
@@ -270,6 +337,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    /// The file worker, but only while this session may copy files to the client.
+    fn to_client_worker(&self) -> Option<&FileWorker> {
+        self.file_worker
+            .as_ref()
+            .filter(|_| self.file_transfer_mode.permits_to_client())
+    }
+
     fn has_local_selection(&self, kind: SelectionKind) -> bool {
         match kind {
             SelectionKind::Text => self
@@ -284,7 +358,6 @@ impl HyprCliprdrBackend {
                 .ok()
                 .and_then(|data| data.as_ref().map(|data| !data.is_empty()))
                 .unwrap_or(false),
-            // No file selection is read from the desktop yet.
             SelectionKind::Files => false,
         }
     }
@@ -441,6 +514,10 @@ impl HyprCliprdrBackend {
             clipboard_image: Arc::clone(&self.clipboard_image),
             pending_write: Arc::clone(&self.pending_write),
             echo_candidate: Arc::clone(&self.echo_candidate),
+            file_selection: FileSelection::new(
+                Arc::clone(&self.files),
+                self.to_client_worker().map(|worker| worker.handle()),
+            ),
         };
 
         match thread::Builder::new()
@@ -464,8 +541,11 @@ impl HyprCliprdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileDescriptor};
     use proptest::prelude::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::Duration;
 
     const ONE_BY_ONE_RGBA_PNG: &[u8] = &[
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
@@ -489,6 +569,9 @@ mod tests {
                 running: Arc::new(AtomicBool::new(true)),
                 last_requested_format: None,
                 pending_echo_candidate: None,
+                file_transfer_mode: FileTransferMode::ToClient,
+                files: Arc::default(),
+                file_worker: None,
             },
             event_rx,
         )
@@ -498,6 +581,290 @@ mod tests {
         let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         bytes.extend_from_slice(&[0, 0]);
         bytes
+    }
+
+    fn recv_file_response(
+        event_rx: &mut mpsc::UnboundedReceiver<ServerEvent>,
+    ) -> FileContentsResponse<'static> {
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsResponse(response))) =
+            event_rx.blocking_recv()
+        else {
+            panic!("expected file response");
+        };
+        response
+    }
+
+    #[test]
+    fn file_request_callback_serves_and_refuses_frozen_file_ranges() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-file-callback-{}", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"clipboard bytes")
+            .unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(super::super::files::freeze_regular_files(
+                vec![path.clone()],
+            ))
+            .into(),
+        ));
+        let worker = FileWorker::start(Arc::clone(&files), event_tx.clone(), 8, 100);
+        let mut backend = HyprCliprdrBackend {
+            event_sender: Some(event_tx),
+            remote_formats: Vec::new(),
+            watcher_thread: None,
+            clipboard_data: Arc::new(Mutex::new(None)),
+            clipboard_image: Arc::new(Mutex::new(None)),
+            pending_write: Arc::new(Mutex::new(None)),
+            echo_candidate: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(true)),
+            last_requested_format: None,
+            pending_echo_candidate: None,
+            file_transfer_mode: FileTransferMode::ToClient,
+            files,
+            file_worker: Some(worker),
+        };
+
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 9,
+            index: 0,
+            flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+            position: 10,
+            requested_size: 8,
+            data_id: None,
+        });
+
+        let response = recv_file_response(&mut event_rx);
+        assert_eq!(response.stream_id(), 9);
+        assert_eq!(response.data(), b"bytes");
+
+        for request in [
+            FileContentsRequest {
+                stream_id: 10,
+                index: 1,
+                flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 1,
+                data_id: None,
+            },
+            FileContentsRequest {
+                stream_id: 11,
+                index: 0,
+                flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 9,
+                data_id: None,
+            },
+        ] {
+            backend.on_file_contents_request(request);
+            assert!(recv_file_response(&mut event_rx).is_error());
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 12,
+            index: 0,
+            flags: ironrdp_cliprdr::pdu::FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        });
+        assert!(recv_file_response(&mut event_rx).is_error());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Builds a directory tree carrying every enumeration hazard ticket 04
+    /// names: an empty directory, a symlink to a file, a symlink cycle back to
+    /// the root, a FIFO, and a socket. Enumerating `root` must yield exactly the
+    /// root, `nested`, `nested/empty`, `nested/document.txt`, and
+    /// `nested/shortcut.txt`.
+    ///
+    /// Returns the bound socket, which the caller must keep alive for the walk.
+    fn build_hazardous_tree(root: &std::path::Path) -> std::os::unix::net::UnixDatagram {
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+        std::fs::File::create(root.join("nested/document.txt"))
+            .unwrap()
+            .write_all(b"contents")
+            .unwrap();
+        std::os::unix::fs::symlink(root, root.join("nested/loop")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("nested/document.txt"),
+            root.join("nested/shortcut.txt"),
+        )
+        .unwrap();
+        let fifo = std::ffi::CString::new(
+            root.join("nested/ignored-fifo")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::net::UnixDatagram::bind(root.join("nested/ignored-socket")).unwrap()
+    }
+
+    #[test]
+    fn file_worker_offers_a_bounded_directory_tree() {
+        let root =
+            std::env::temp_dir().join(format!("hypr-rdp-file-worker-{}", std::process::id()));
+        let socket = build_hazardous_tree(&root);
+
+        let (mut backend, mut events) = backend_with_events();
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            10,
+        );
+        assert!(worker.handle().freeze(vec![root.clone()], 0));
+
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the file offer");
+        };
+        let decoded = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
+        let root_name = root.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                root_name,
+                &format!("{root_name}\\nested"),
+                &format!("{root_name}\\nested\\empty"),
+                &format!("{root_name}\\nested\\document.txt"),
+                &format!("{root_name}\\nested\\shortcut.txt"),
+            ]
+        );
+        // Directories arrive as directories and carry no content length; the
+        // symlink arrives as the file it points at.
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| (descriptor.attributes, descriptor.file_size))
+                .collect::<Vec<_>>(),
+            [
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
+            ]
+        );
+
+        drop(worker);
+
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            3,
+        );
+        assert!(worker.handle().freeze(vec![root.clone()], 0));
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a truncated file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the truncated file offer");
+        };
+        let truncated = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
+        // The work budget counts inspected entries, including skipped sockets
+        // and cycles. Which child survives depends on read_dir order.
+        assert!((2..=3).contains(&truncated.files.len()));
+        assert_eq!(truncated.files[0].name, root_name);
+        assert_eq!(truncated.files[1].name, format!("{root_name}\\nested"));
+
+        drop(worker);
+        drop(socket);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_offer_adjusts_names_that_windows_would_reject_without_dropping_them() {
+        let (mut backend, mut events) = backend_with_events();
+        let root = std::env::temp_dir().join(format!(
+            "hypr-rdp-name-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let paths = [
+            "a:b".into(),
+            "a?b".into(),
+            "CON.txt".into(),
+            "trailing. ".into(),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ]
+        .into_iter()
+        .map(|name: std::ffi::OsString| {
+            let path = root.join(name);
+            std::fs::File::create(&path).unwrap();
+            path
+        })
+        .collect();
+        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_paths(paths, 100));
+
+        backend.on_request_format_list();
+
+        let descriptors = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for file offer")
+                    .expect("backend stopped before offering files");
+                let ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors)) =
+                    event
+                else {
+                    panic!("expected a file offer");
+                };
+                descriptors
+            });
+        let decoded: Vec<FileDescriptor> = descriptors
+            .iter()
+            .map(|descriptor| {
+                ironrdp_core::decode(&ironrdp_core::encode_vec(descriptor).unwrap()).unwrap()
+            })
+            .collect();
+
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a_b", "a_b (2)", "CON_.txt", "trailing", "�"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

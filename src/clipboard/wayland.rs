@@ -16,6 +16,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
+use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
     PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
     UTF8_MIME,
@@ -34,6 +35,7 @@ pub(super) struct ClipboardShared {
     pub(super) clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pub(super) pending_write: Arc<Mutex<Option<PendingWrite>>>,
     pub(super) echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    pub(super) file_selection: FileSelection,
 }
 
 pub(super) fn clipboard_thread(
@@ -159,6 +161,7 @@ struct ClipState {
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    file_selection: FileSelection,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -182,6 +185,7 @@ impl ClipState {
             clipboard_image: shared.clipboard_image,
             pending_write: shared.pending_write,
             echo_candidate: shared.echo_candidate,
+            file_selection: shared.file_selection,
             manager: None,
             seat: None,
             device: None,
@@ -200,6 +204,11 @@ impl ClipState {
         if let Ok(mut image) = self.clipboard_image.lock() {
             *image = None;
         }
+        self.file_selection.clear();
+    }
+
+    fn local_owner_changed(&self) {
+        self.file_selection.clear();
     }
 
     /// Take one pending write and arm suppression before replacing its source.
@@ -320,6 +329,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     return;
                 }
 
+                state.local_owner_changed();
                 if let Ok(mut candidate) = state.echo_candidate.lock() {
                     *candidate = None;
                 }
@@ -344,8 +354,9 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 
                 let text_mime = SelectionKind::Text.offered_wayland_mime(&mimes);
                 let image_mime = SelectionKind::Image.offered_wayland_mime(&mimes);
+                let files_mime = SelectionKind::Files.offered_wayland_mime(&mimes);
 
-                if text_mime.is_none() && image_mime.is_none() {
+                if text_mime.is_none() && image_mime.is_none() && files_mime.is_none() {
                     // No supported MIME — clear stale caches
                     state.clear_cached_selection();
                     offer.destroy();
@@ -403,6 +414,21 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+
+                if let Some(ref mime) = files_mime {
+                    if let Some(uri_list) = read_offer_data(&offer, mime, conn) {
+                        if !state.file_selection.freeze(uri_list_paths(&uri_list))
+                            && text_mime.is_none()
+                            && !uri_list.is_empty()
+                        {
+                            // URI lists without file entries remain ordinary text clipboard data.
+                            if let Ok(mut data) = state.clipboard_data.lock() {
+                                *data = Some(uri_list);
+                            }
+                            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
                         }
                     }
                 }
@@ -749,6 +775,7 @@ mod tests {
             clipboard_image: Arc::new(Mutex::new(None)),
             pending_write: Arc::new(Mutex::new(None)),
             echo_candidate: Arc::new(Mutex::new(None)),
+            file_selection: FileSelection::new(Arc::default(), None),
         })
     }
 
