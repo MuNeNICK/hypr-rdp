@@ -5,7 +5,6 @@
   cmake,
   clang,
   makeWrapper,
-  ffmpeg,
   libdrm,
   libgbm,
   libva,
@@ -25,7 +24,7 @@ rustPlatform.buildRustPackage {
 
   src = lib.cleanSource ../..;
 
-  cargoHash = "sha256-epx63PKwKL4lPiLlg8kx6WA/WhO4qhEs3QxFsIr2/nI=";
+  cargoHash = "sha256-CnpUVqFJoNuqQC8qBSbZtmzWD220BAmng5hAyowseMo=";
 
   nativeBuildInputs = [
     pkg-config
@@ -36,7 +35,6 @@ rustPlatform.buildRustPackage {
   ];
 
   buildInputs = [
-    ffmpeg
     libdrm
     libgbm
     libva
@@ -47,6 +45,7 @@ rustPlatform.buildRustPackage {
   ];
 
   postInstall = ''
+    install -Dm644 LICENSE $out/share/licenses/hypr-rdp/LICENSE
     wrapProgram $out/bin/hypr-rdp \
       --prefix PATH : ${lib.makeBinPath [ pulseaudio ]}
   '';

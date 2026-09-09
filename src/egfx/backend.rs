@@ -88,7 +88,7 @@ impl FrameEncoder {
         }
 
         let enc = H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using FFmpeg/libavcodec software H.264 encoder");
+        tracing::info!("Using OpenH264 software encoder");
         Ok(Self::Software(Box::new(enc)))
     }
 
@@ -199,7 +199,7 @@ impl FrameEncoder {
             Self::Vaapi(_) => "vaapi",
             #[cfg(test)]
             Self::FailingVaapiForTest { .. } => "vaapi-test-failing",
-            Self::Software(_) => "ffmpeg-h264",
+            Self::Software(_) => "openh264",
             Self::SoftwareAvc444(enc) => enc.backend_name(),
         }
     }
@@ -225,7 +225,7 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         let enc = H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using FFmpeg/libavcodec software H.264 encoder (runtime fallback)");
+        tracing::info!("Using OpenH264 software encoder (runtime fallback)");
         Ok(Self::Software(Box::new(enc)))
     }
 
@@ -259,33 +259,12 @@ impl FrameEncoder {
         quality: u8,
         rate_control: H264RateControl,
     ) -> Result<Self> {
-        #[cfg(feature = "vaapi")]
-        if policy.allows_vaapi() {
-            match Avc444Encoder::new_with_vaapi(width, height, bitrate, fps, quality, rate_control)
-            {
-                Ok(enc) => {
-                    tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
-                    return Ok(Self::SoftwareAvc444(Box::new(enc)));
-                }
-                Err(e) if !policy.allows_software() => {
-                    return Err(e.context("h264_backend=vaapi requested but VA-API init failed"));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "VA-API AVC444 init failed, falling back to software: {:#}",
-                        e
-                    );
-                }
-            }
-        }
-
-        #[cfg(not(feature = "vaapi"))]
         if !policy.allows_software() {
-            anyhow::bail!("h264_backend=vaapi requested but built without the vaapi feature");
+            anyhow::bail!("h264_backend=vaapi requested for AVC444, but the native VA-API backend only supports AVC420");
         }
 
         let enc = Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
+        tracing::info!("Using OpenH264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
     }
 
@@ -298,7 +277,7 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         let enc = Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
+        tracing::info!("Using OpenH264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
     }
 
@@ -377,7 +356,7 @@ mod tests {
         )
         .expect("software encoder initializes");
 
-        assert_eq!(encoder.backend_name(), "ffmpeg-h264");
+        assert_eq!(encoder.backend_name(), "openh264");
         assert!(!encoder.is_vaapi());
     }
 
@@ -397,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn avc444_software_backend_reports_ffmpeg_and_not_vaapi() {
+    fn avc444_software_backend_reports_openh264_and_not_vaapi() {
         let encoder = FrameEncoder::new_avc444(
             H264BackendPolicy::Software,
             64,
@@ -409,7 +388,7 @@ mod tests {
         )
         .expect("software AVC444 encoder initializes");
 
-        assert_eq!(encoder.backend_name(), "ffmpeg-avc444");
+        assert_eq!(encoder.backend_name(), "openh264-avc444");
         assert!(!encoder.is_vaapi());
     }
 
@@ -444,6 +423,6 @@ mod tests {
             Ok(_) => panic!("VA-API must be unavailable"),
             Err(error) => error,
         };
-        assert!(format!("{avc444_error:#}").contains("built without the vaapi feature"));
+        assert!(format!("{avc444_error:#}").contains("native VA-API backend only supports AVC420"));
     }
 }

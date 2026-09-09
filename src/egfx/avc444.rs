@@ -2,10 +2,6 @@ use anyhow::{bail, Result};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "vaapi")]
-use super::h264::avc444_h264_vaapi_encoder_options;
-#[cfg(feature = "vaapi")]
-use super::h264::initial_h264_bootstrap_is_sendable;
 #[cfg(test)]
 use super::h264::H264FrameType;
 use super::h264::{
@@ -13,9 +9,6 @@ use super::h264::{
     H264EncoderOptions,
 };
 use super::H264RateControl;
-
-#[cfg(feature = "vaapi")]
-const AVC444_VAAPI_VBR_BITRATE_MULTIPLIER: u32 = 4;
 
 pub(crate) fn avc444_dimensions_supported(width: u32, height: u32) -> bool {
     width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
@@ -134,57 +127,6 @@ impl Avc444Encoder {
         )
     }
 
-    #[cfg(feature = "vaapi")]
-    pub(crate) fn new_with_vaapi(
-        width: u32,
-        height: u32,
-        bitrate: u32,
-        fps: u32,
-        qp: u8,
-        rate_control: H264RateControl,
-    ) -> Result<Self> {
-        if !avc444_dimensions_supported(width, height) {
-            bail!(
-                "AVC444v2 dimensions must be non-zero, width must be divisible by 4, and height must be even: {}x{}",
-                width,
-                height
-            );
-        }
-
-        let effective_bitrate = avc444_vaapi_effective_bitrate(bitrate, rate_control);
-        tracing::info!(
-            requested_bitrate = bitrate,
-            effective_bitrate,
-            multiplier = AVC444_VAAPI_VBR_BITRATE_MULTIPLIER,
-            rate_control = ?rate_control,
-            "Configuring FFmpeg/VAAPI AVC444 bitrate"
-        );
-
-        Self::validate_vaapi_avc444_bootstrap(
-            width,
-            height,
-            effective_bitrate,
-            fps,
-            qp,
-            rate_control,
-        )?;
-
-        let encoder = H264Encoder::new_with_options(
-            width,
-            height,
-            effective_bitrate,
-            fps,
-            qp,
-            rate_control,
-            avc444_h264_vaapi_encoder_options(),
-        )?;
-        Self::new_with_encoder(
-            width,
-            height,
-            Avc444H264Encoder::FfmpegVaapi(Box::new(encoder)),
-        )
-    }
-
     fn new_with_encoder(width: u32, height: u32, encoder: Avc444H264Encoder) -> Result<Self> {
         let w = width as usize;
         let h = height as usize;
@@ -210,37 +152,6 @@ impl Avc444Encoder {
             force_chroma_on_next_frame: true,
             perf_stats: Avc444PerfStats::new(),
         })
-    }
-
-    #[cfg(feature = "vaapi")]
-    fn validate_vaapi_avc444_bootstrap(
-        width: u32,
-        height: u32,
-        bitrate: u32,
-        fps: u32,
-        qp: u8,
-        rate_control: H264RateControl,
-    ) -> Result<()> {
-        let mut encoder = H264Encoder::new_with_options(
-            width,
-            height,
-            bitrate,
-            fps,
-            qp,
-            rate_control,
-            avc444_h264_vaapi_encoder_options(),
-        )?;
-        let y = vec![16; width as usize * height as usize];
-        let uv = vec![128; (width as usize / 2) * (height as usize / 2)];
-        let encoded = encoder.encode_yuv420_raw(&y, &uv, &uv)?;
-        anyhow::ensure!(
-            initial_h264_bootstrap_is_sendable(&encoded),
-            "FFmpeg/VAAPI AVC444 initial H.264 stream is not decoder-bootstrap-safe: frame_type={:?}, nal_types={:?}, bytes={}",
-            encoded.frame_type,
-            annex_b_nal_types(&encoded.data),
-            encoded.data.len()
-        );
-        Ok(())
     }
 
     pub(crate) fn backend_name(&self) -> &'static str {
@@ -555,18 +466,8 @@ impl Avc444Encoder {
     }
 }
 
-#[cfg(feature = "vaapi")]
-fn avc444_vaapi_effective_bitrate(bitrate: u32, rate_control: H264RateControl) -> u32 {
-    match rate_control {
-        H264RateControl::Vbr => bitrate.saturating_mul(AVC444_VAAPI_VBR_BITRATE_MULTIPLIER),
-        H264RateControl::Cqp => bitrate,
-    }
-}
-
 enum Avc444H264Encoder {
     Software(Box<H264Encoder>),
-    #[cfg(feature = "vaapi")]
-    FfmpegVaapi(Box<H264Encoder>),
 }
 
 impl Avc444H264Encoder {
@@ -582,35 +483,24 @@ impl Avc444H264Encoder {
                 let _ = role;
                 encoder.encode_yuv420_raw(y, u, v)
             }
-            #[cfg(feature = "vaapi")]
-            Self::FfmpegVaapi(encoder) => {
-                let _ = role;
-                encoder.encode_yuv420_raw(y, u, v)
-            }
         }
     }
 
     fn force_idr(&mut self) {
         match self {
             Self::Software(encoder) => encoder.force_idr(),
-            #[cfg(feature = "vaapi")]
-            Self::FfmpegVaapi(encoder) => encoder.force_idr(),
         }
     }
 
     fn backend_name(&self) -> &'static str {
         match self {
-            Self::Software(_) => "ffmpeg-avc444",
-            #[cfg(feature = "vaapi")]
-            Self::FfmpegVaapi(_) => "ffmpeg-vaapi-avc444",
+            Self::Software(_) => "openh264-avc444",
         }
     }
 
     fn is_vaapi(&self) -> bool {
         match self {
             Self::Software(_) => false,
-            #[cfg(feature = "vaapi")]
-            Self::FfmpegVaapi(_) => true,
         }
     }
 
@@ -618,8 +508,6 @@ impl Avc444H264Encoder {
     fn force_idr_requests_for_test(&self) -> u32 {
         match self {
             Self::Software(encoder) => encoder.force_idr_requests_for_test(),
-            #[cfg(feature = "vaapi")]
-            Self::FfmpegVaapi(encoder) => encoder.force_idr_requests_for_test(),
         }
     }
 }
@@ -1693,35 +1581,11 @@ mod tests {
     }
 
     #[test]
-    fn avc444_v2_encoder_options_use_ffmpeg_libavcodec_backend_policy() {
+    fn avc444_v2_encoder_options_prevent_subframe_loss() {
         let options = avc444_h264_encoder_options();
 
-        assert!(!options.ffmpeg_vaapi);
-    }
-
-    #[cfg(feature = "vaapi")]
-    #[test]
-    fn avc444_vaapi_options_use_ffmpeg_h264_vaapi_policy() {
-        let options = avc444_h264_vaapi_encoder_options();
-
-        assert!(options.ffmpeg_vaapi);
-    }
-
-    #[cfg(feature = "vaapi")]
-    #[test]
-    fn avc444_vaapi_vbr_uses_effective_bitrate_for_two_subframe_stream() {
-        assert_eq!(
-            avc444_vaapi_effective_bitrate(10_000_000, H264RateControl::Vbr),
-            40_000_000
-        );
-        assert_eq!(
-            avc444_vaapi_effective_bitrate(10_000_000, H264RateControl::Cqp),
-            10_000_000
-        );
-        assert_eq!(
-            avc444_vaapi_effective_bitrate(u32::MAX, H264RateControl::Vbr),
-            u32::MAX
-        );
+        assert!(!options.scene_change_detect);
+        assert!(!options.frame_skip);
     }
 
     #[test]
@@ -1923,7 +1787,6 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -1969,7 +1832,6 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2015,7 +1877,6 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2072,7 +1933,6 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2121,7 +1981,6 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2157,7 +2016,6 @@ mod tests {
 
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2231,7 +2089,6 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2255,7 +2112,6 @@ mod tests {
         let mut encoder = match Avc444Encoder::new(16, 16, 1_000_000, 30, 23, H264RateControl::Cqp)
         {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2386,7 +2242,6 @@ mod tests {
     fn avc444_v2_configured_encoder_uses_delta_slices_after_initial_frame() {
         let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
             Ok(profiles) => profiles,
-            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder failed: {error}"),
         };
 
@@ -2407,7 +2262,6 @@ mod tests {
     fn avc444_v2_configured_encoder_keeps_initial_payload_sendable() {
         let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
             Ok(profiles) => profiles,
-            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder failed: {error}"),
         };
 
@@ -2467,11 +2321,6 @@ mod tests {
         .map_err(|error| format!("{error:#}"))
     }
 
-    fn h264_backend_unavailable(error: &str) -> bool {
-        error.contains("FFmpeg H.264 encoder not found")
-            || error.contains("failed to initialize FFmpeg H.264")
-    }
-
     #[test]
     fn avc444_force_idr_after_empty_output_recovers_with_full_lc0_and_stream1_idr() {
         let width = 16;
@@ -2480,7 +2329,6 @@ mod tests {
         let bgra = gradient_bgra_frame(width, height, stride);
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2559,7 +2407,6 @@ mod tests {
 
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2611,7 +2458,6 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2661,7 +2507,6 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2745,7 +2590,6 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 

@@ -389,10 +389,8 @@ impl Avc444PresentationOracle {
 }
 
 fn test_openh264_decoder() -> Decoder {
-    // OpenH264 is test-only here: it is a reduced downstream decoder oracle,
-    // not the runtime encoder backend.
-    let api = unsafe { OpenH264API::from_blob_path_unchecked("libopenh264.so") }
-        .expect("libopenh264.so must load for AVC444 stream-decode coverage");
+    // A separate decoder instance validates the encoded stream.
+    let api = OpenH264API::from_source();
     Decoder::with_api_config(api, DecoderConfig::default())
         .expect("OpenH264 decoder must initialize for AVC444 stream-decode coverage")
 }
