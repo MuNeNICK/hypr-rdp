@@ -1672,13 +1672,12 @@ mod tests {
             .collect()
     }
 
-    fn decoded_luma_mse(picture: &ffmpeg_next::frame::Video, expected: &[u8]) -> f64 {
-        let width = picture.width() as usize;
-        let height = picture.height() as usize;
-        let stride = picture.stride(0);
+    fn decoded_luma_mse(picture: &impl openh264::formats::YUVSource, expected: &[u8]) -> f64 {
+        let (width, height) = picture.dimensions();
+        let (stride, _, _) = picture.strides();
         let mut squared_error = 0u64;
         for (row, expected_row) in expected.chunks_exact(width).enumerate().take(height) {
-            let decoded_row = &picture.data(0)[row * stride..row * stride + width];
+            let decoded_row = &picture.y()[row * stride..row * stride + width];
             for (&actual, &target) in decoded_row.iter().zip(expected_row) {
                 let error = i32::from(actual) - i32::from(target);
                 squared_error += (error * error) as u64;
@@ -1690,7 +1689,8 @@ mod tests {
     #[test]
     #[ignore = "requires a VA-API H.264 encoder"]
     fn vaapi_vbr_abrupt_scene_recovers_decoded_quality_without_human_viewing() {
-        use ffmpeg_next as ffmpeg;
+        use openh264::decoder::{Decoder, DecoderConfig};
+        use openh264::OpenH264API;
 
         const WIDTH: usize = 1920;
         const HEIGHT: usize = 1200;
@@ -1707,13 +1707,9 @@ mod tests {
             H264RateControl::Vbr,
         )
         .expect("raw VA-API VBR encoder must initialize");
-        ffmpeg::init().expect("FFmpeg must initialize");
-        let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264)
-            .expect("FFmpeg H.264 decoder must be available");
-        let mut decoder = ffmpeg::codec::context::Context::new_with_codec(codec)
-            .decoder()
-            .video()
-            .expect("FFmpeg H.264 decoder must initialize");
+        let api = OpenH264API::from_source();
+        let mut decoder = Decoder::with_api_config(api, DecoderConfig::default())
+            .expect("OpenH264 decoder must initialize");
         let before = tiled_bgra_frame(WIDTH, HEIGHT, 0);
         let settled = tiled_bgra_frame(WIDTH, HEIGHT, 100);
 
@@ -1722,11 +1718,8 @@ mod tests {
                 .encode(&before, WIDTH * 4)
                 .expect("pre-transition frame must encode");
             decoder
-                .send_packet(&ffmpeg::Packet::copy(&packet))
-                .expect("pre-transition packet must be accepted");
-            let mut picture = ffmpeg::frame::Video::empty();
-            decoder
-                .receive_frame(&mut picture)
+                .decode(&packet)
+                .expect("pre-transition packet must be accepted")
                 .expect("pre-transition packet must produce a picture");
         }
 
@@ -1744,12 +1737,9 @@ mod tests {
             let packet = encoder
                 .encode(current, WIDTH * 4)
                 .expect("post-transition frame must encode");
-            decoder
-                .send_packet(&ffmpeg::Packet::copy(&packet))
-                .expect("post-transition packet must be accepted");
-            let mut picture = ffmpeg::frame::Video::empty();
-            decoder
-                .receive_frame(&mut picture)
+            let picture = decoder
+                .decode(&packet)
+                .expect("post-transition packet must be accepted")
                 .expect("post-transition packet must produce a picture");
             let mse = decoded_luma_mse(&picture, &expected);
             eprintln!(

@@ -9,7 +9,7 @@ Native RDP server for Hyprland.
 - Clipboard file transfer from the desktop to the client
 - TLS certificates and optional session hooks
 
-Requires **Hyprland 0.54+**. AVC420 is the default codec; AVC444 is experimental.
+Requires **Hyprland 0.54+**. AVC420 is the default codec; AVC444 is experimental and currently uses software encoding.
 
 ## Installation
 
@@ -38,14 +38,14 @@ tar xzf hypr-rdp-v*.tar.gz
 sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Runtime dependencies: `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon`,
+Runtime dependencies: `libva`, `pipewire`, `libxkbcommon`,
 and `pactl` for the default audio routing mode. Hardware encoding also needs
-an appropriate VA-API driver.
+an appropriate VA-API driver. The software encoder uses bundled OpenH264.
 
 ### Build from source
 
-Install a current stable Rust toolchain and development headers for FFmpeg,
-libva, PipeWire, libxkbcommon, Wayland, and GBM.
+Install a current stable Rust toolchain, a C/C++ compiler, and development headers
+for libva, PipeWire, libxkbcommon, Wayland, and GBM.
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
