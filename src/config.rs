@@ -10,6 +10,41 @@ use crate::egfx::{
     EgfxCodecPolicy, H264BackendPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT,
 };
 use crate::input::KeyboardLayoutPolicy;
+use ironrdp_cliprdr::pdu::MAX_FILE_COUNT;
+
+pub(crate) const DEFAULT_FILE_TRANSFER_MAX_ENTRIES: usize = 10_000;
+
+/// Which directions of clipboard file transfer a session may serve.
+///
+/// Only the outbound direction exists so far, so this is a two-state choice the
+/// inbound direction will widen rather than replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileTransferMode {
+    Off,
+    ToClient,
+}
+
+impl FileTransferMode {
+    pub(crate) fn permits_to_client(self) -> bool {
+        matches!(self, Self::ToClient)
+    }
+}
+
+fn default_file_transfer_mode_name() -> String {
+    "to-client".into()
+}
+
+/// The command line beats the config file, as it does for every other option.
+fn resolve_file_transfer_mode(
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<FileTransferMode> {
+    parse_file_transfer_mode(
+        &cli_value
+            .or(config_value)
+            .unwrap_or_else(default_file_transfer_mode_name),
+    )
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
@@ -102,6 +137,18 @@ struct Args {
     #[arg(long)]
     on_session_end: Option<String>,
 
+    /// File transfer policy: "off" or "to-client"
+    #[arg(long)]
+    file_transfer_mode: Option<String>,
+
+    /// Maximum bytes accepted in one clipboard file-content range request
+    #[arg(long)]
+    file_transfer_max_chunk_bytes: Option<u32>,
+
+    /// Maximum files and directories enumerated from one clipboard selection
+    #[arg(long)]
+    file_transfer_max_entries: Option<usize>,
+
     /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
     #[arg(long)]
     config: Option<String>,
@@ -130,6 +177,9 @@ struct ConfigFile {
     output: Option<String>,
     on_session_start: Option<String>,
     on_session_end: Option<String>,
+    file_transfer_mode: Option<String>,
+    file_transfer_max_chunk_bytes: Option<u32>,
+    file_transfer_max_entries: Option<usize>,
 }
 
 impl ConfigFile {
@@ -198,6 +248,9 @@ pub struct RuntimeConfig {
     pub output: Option<String>,
     pub on_session_start: Option<String>,
     pub on_session_end: Option<String>,
+    pub file_transfer_mode: FileTransferMode,
+    pub file_transfer_max_chunk_bytes: u32,
+    pub file_transfer_max_entries: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -265,6 +318,8 @@ impl RuntimeConfig {
             config.password_file,
         )?;
         let credentials = ConfigCredentials::from_parts(username, password);
+        let file_transfer_mode =
+            resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
 
         for warning in startup_warnings(credentials.as_ref(), bind) {
             match warning {
@@ -313,6 +368,14 @@ impl RuntimeConfig {
         let output = args.output.or(config.output);
         let on_session_start = args.on_session_start.or(config.on_session_start);
         let on_session_end = args.on_session_end.or(config.on_session_end);
+        let file_transfer_max_chunk_bytes = args
+            .file_transfer_max_chunk_bytes
+            .or(config.file_transfer_max_chunk_bytes)
+            .unwrap_or(8 * 1024 * 1024);
+        let file_transfer_max_entries = args
+            .file_transfer_max_entries
+            .or(config.file_transfer_max_entries)
+            .unwrap_or(DEFAULT_FILE_TRANSFER_MAX_ENTRIES);
 
         let resolution = parse_resolution(&resolution_str)?;
         let capture_mode = parse_capture_mode(&capture_mode_str)?;
@@ -326,6 +389,10 @@ impl RuntimeConfig {
         if max_frames_in_flight == 0 {
             anyhow::bail!("max-frames-in-flight must be > 0");
         }
+        if file_transfer_max_chunk_bytes == 0 {
+            anyhow::bail!("file-transfer-max-chunk-bytes must be > 0");
+        }
+        validate_file_transfer_max_entries(file_transfer_max_entries)?;
 
         Ok(Self {
             bind,
@@ -348,7 +415,32 @@ impl RuntimeConfig {
             output,
             on_session_start,
             on_session_end,
+            file_transfer_mode,
+            file_transfer_max_chunk_bytes,
+            file_transfer_max_entries,
         })
+    }
+}
+
+fn validate_file_transfer_max_entries(value: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("file-transfer-max-entries must be > 0");
+    }
+    if value > MAX_FILE_COUNT {
+        anyhow::bail!(
+            "file-transfer-max-entries must be at most {MAX_FILE_COUNT}, the clipboard protocol limit"
+        );
+    }
+    Ok(())
+}
+
+fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
+    match value {
+        "off" => Ok(FileTransferMode::Off),
+        "to-client" => Ok(FileTransferMode::ToClient),
+        other => {
+            anyhow::bail!("unknown file transfer mode '{other}', expected 'off' or 'to-client'")
+        }
     }
 }
 
@@ -641,6 +733,45 @@ mod tests {
     fn invalid_bind_address_is_rejected_by_config() {
         let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
         assert!(format!("{error:#}").contains("invalid bind address"));
+    }
+
+    #[test]
+    fn file_transfer_mode_accepts_all_documented_values() {
+        assert_eq!(
+            parse_file_transfer_mode("off").unwrap(),
+            FileTransferMode::Off
+        );
+        assert_eq!(
+            parse_file_transfer_mode("to-client").unwrap(),
+            FileTransferMode::ToClient
+        );
+        assert!(FileTransferMode::ToClient.permits_to_client());
+        assert!(!FileTransferMode::Off.permits_to_client());
+        assert!(parse_file_transfer_mode("invalid").is_err());
+    }
+
+    #[test]
+    fn file_transfer_is_on_for_the_client_by_default() {
+        assert_eq!(
+            resolve_file_transfer_mode(None, None).unwrap(),
+            FileTransferMode::ToClient
+        );
+    }
+
+    #[test]
+    fn a_mode_on_the_command_line_overrides_the_config_file() {
+        assert_eq!(
+            resolve_file_transfer_mode(Some("off".into()), Some("to-client".into())).unwrap(),
+            FileTransferMode::Off
+        );
+    }
+
+    #[test]
+    fn file_transfer_entry_limit_stays_within_the_protocol_limit() {
+        assert!(validate_file_transfer_max_entries(1).is_ok());
+        assert!(validate_file_transfer_max_entries(MAX_FILE_COUNT).is_ok());
+        assert!(validate_file_transfer_max_entries(0).is_err());
+        assert!(validate_file_transfer_max_entries(MAX_FILE_COUNT + 1).is_err());
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

@@ -305,7 +305,11 @@ fn emit_scroll_axis(
     delta_units: i32,
     residual: &mut i64,
 ) {
-    let (continuous, discrete) = scroll_axis_step(residual, delta_units);
+    // RDP and Wayland disagree about the vertical axis and agree about the
+    // horizontal one, so only one of them is turned around. See
+    // `scroll_axis_step`.
+    let invert = matches!(axis, Axis::VerticalScroll);
+    let (continuous, discrete) = scroll_axis_step(residual, delta_units, invert);
     if discrete == 0 {
         sink.axis(time, axis, continuous);
     } else {
@@ -316,13 +320,21 @@ fn emit_scroll_axis(
 /// Convert integer RDP wheel units into Wayland continuous motion and whole
 /// detents. Keeping the remainder in RDP units avoids floating-point drift at
 /// the 120-unit detent boundary.
-fn scroll_axis_step(residual: &mut i64, delta_units: i32) -> (f64, i32) {
-    let continuous = -(f64::from(delta_units) / 120.0) * 15.0;
+///
+/// `invert` turns the axis around. RDP counts a wheel rotated forward and a
+/// wheel rotated right as positive, while libinput documents its own positive
+/// direction as "down or right", so the two agree horizontally and disagree
+/// vertically. The remainder is kept in RDP units either way, so accumulation
+/// is unaffected by the sign.
+fn scroll_axis_step(residual: &mut i64, delta_units: i32, invert: bool) -> (f64, i32) {
+    let sign = if invert { -1.0 } else { 1.0 };
+    let continuous = sign * (f64::from(delta_units) / 120.0) * 15.0;
     let accumulated = *residual + i64::from(delta_units);
-    let discrete = accumulated / 120;
+    let detents = accumulated / 120;
     *residual = accumulated % 120;
+    let detents = if invert { -detents } else { detents };
     let wayland_discrete =
-        i32::try_from(-discrete).expect("i32 wheel delta produces i32 detent count");
+        i32::try_from(detents).expect("i32 wheel delta produces i32 detent count");
     (continuous, wayland_discrete)
 }
 
@@ -1087,11 +1099,24 @@ mod tests {
     }
 
     #[test]
+    fn only_the_vertical_axis_is_turned_around() {
+        // RDP counts a wheel rotated forward and a wheel rotated right as
+        // positive; libinput's own positive direction is "down or right"
+        // (libinput.h). So the vertical axis has to be flipped and the
+        // horizontal one must be left alone.
+        let mut vertical = 0;
+        let mut horizontal = 0;
+
+        assert_eq!(scroll_axis_step(&mut vertical, 120, true), (-15.0, -1));
+        assert_eq!(scroll_axis_step(&mut horizontal, 120, false), (15.0, 1));
+    }
+
+    #[test]
     fn scroll_full_detent_reports_a_discrete_step() {
         let mut residual = 0;
 
-        assert_eq!(scroll_axis_step(&mut residual, 120), (-15.0, -1));
-        assert_eq!(scroll_axis_step(&mut residual, -120), (15.0, 1));
+        assert_eq!(scroll_axis_step(&mut residual, 120, true), (-15.0, -1));
+        assert_eq!(scroll_axis_step(&mut residual, -120, true), (15.0, 1));
         assert_eq!(residual, 0);
     }
 
@@ -1103,7 +1128,7 @@ mod tests {
         let mut discrete_total = 0;
         let mut continuous_total = 0.0;
         for _ in 0..12 {
-            let (continuous, discrete) = scroll_axis_step(&mut residual, 10);
+            let (continuous, discrete) = scroll_axis_step(&mut residual, 10, true);
             continuous_total += continuous;
             discrete_total += discrete;
         }
@@ -1117,8 +1142,8 @@ mod tests {
     fn scroll_direction_change_cancels_the_residual() {
         let mut residual = 0;
 
-        assert_eq!(scroll_axis_step(&mut residual, 60).1, 0);
-        assert_eq!(scroll_axis_step(&mut residual, -60).1, 0);
+        assert_eq!(scroll_axis_step(&mut residual, 60, true).1, 0);
+        assert_eq!(scroll_axis_step(&mut residual, -60, true).1, 0);
         assert_eq!(residual, 0);
     }
 
@@ -1126,7 +1151,7 @@ mod tests {
     fn scroll_oversized_delta_reports_multiple_detents_and_keeps_remainder() {
         let mut residual = 0;
 
-        let (continuous, discrete) = scroll_axis_step(&mut residual, 250);
+        let (continuous, discrete) = scroll_axis_step(&mut residual, 250, true);
         assert_eq!(discrete, -2);
         assert!((continuous - -31.25).abs() < 1e-9);
         assert_eq!(residual, 10);
@@ -1169,6 +1194,8 @@ mod tests {
 
     #[test]
     fn scroll_event_emits_both_axes_with_one_wayland_frame() {
+        // The horizontal delta arrives positive and stays positive: a wheel
+        // rotated right is a scroll right in both conventions.
         let sink = RecordingScrollSink::default();
         let mut horizontal_residual = 0;
         let mut vertical_residual = 0;
@@ -1187,7 +1214,7 @@ mod tests {
             [
                 RecordedScrollRequest::Source(AxisSource::Wheel),
                 RecordedScrollRequest::Axis(42, Axis::VerticalScroll, -1.25),
-                RecordedScrollRequest::Discrete(42, Axis::HorizontalScroll, -15.0, -1),
+                RecordedScrollRequest::Discrete(42, Axis::HorizontalScroll, 15.0, 1),
                 RecordedScrollRequest::Frame,
             ]
         );
@@ -1451,13 +1478,15 @@ mod tests {
     fn horizontal_scroll_travels_on_the_horizontal_axis() {
         let sink = RecordingPointerSink::default();
 
+        // A wheel rotated right is a scroll right in both RDP and Wayland, so
+        // a positive delta stays positive (no inversion on this axis).
         assert!(emit_one(&sink, MouseEvent::HorizontalScroll { value: 120 }));
 
         assert_eq!(
             *sink.0.borrow(),
             [
                 RecordedPointerRequest::Source(AxisSource::Wheel),
-                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, -15.0, -1),
+                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, 15.0, 1),
                 RecordedPointerRequest::Frame,
             ]
         );
@@ -1534,12 +1563,14 @@ mod tests {
 
         assert!(emit_one(&sink, MouseEvent::Scroll { x: 120, y: 240 }));
 
+        // Vertical is inverted (RDP forward = up, Wayland positive = down);
+        // horizontal is not (both agree right is positive).
         assert_eq!(
             *sink.0.borrow(),
             [
                 RecordedPointerRequest::Source(AxisSource::Wheel),
                 RecordedPointerRequest::Discrete(7, Axis::VerticalScroll, -30.0, -2),
-                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, -15.0, -1),
+                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, 15.0, 1),
                 RecordedPointerRequest::Frame,
             ]
         );

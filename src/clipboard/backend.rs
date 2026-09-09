@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
+#[cfg(test)]
+use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
@@ -13,10 +15,16 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::formats::{
-    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE,
+use super::files::{
+    clear_selection, file_stream_enabled, set_file_capabilities, FileSelection, FileWorker,
+    FrozenFiles,
 };
-use super::wayland::clipboard_thread;
+use super::formats::{
+    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
+    MAX_CLIPBOARD_SIZE,
+};
+use super::wayland::{clipboard_thread, ClipboardShared};
+use crate::config::FileTransferMode;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ClipboardEchoCandidate {
@@ -70,11 +78,23 @@ pub(super) fn announce_local_formats(
 
 pub struct HyprCliprdrFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    file_transfer_mode: FileTransferMode,
+    file_transfer_max_chunk_bytes: u32,
+    file_transfer_max_entries: usize,
 }
 
 impl HyprCliprdrFactory {
-    pub fn new() -> Self {
-        Self { event_sender: None }
+    pub fn new(
+        file_transfer_mode: FileTransferMode,
+        file_transfer_max_chunk_bytes: u32,
+        file_transfer_max_entries: usize,
+    ) -> Self {
+        Self {
+            event_sender: None,
+            file_transfer_mode,
+            file_transfer_max_chunk_bytes,
+            file_transfer_max_entries,
+        }
     }
 }
 
@@ -91,7 +111,15 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
         let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
         let running = Arc::new(AtomicBool::new(true));
-
+        let files: FrozenFiles = Arc::default();
+        let file_worker = self.event_sender.as_ref().map(|sender| {
+            FileWorker::start(
+                Arc::clone(&files),
+                sender.clone(),
+                self.file_transfer_max_chunk_bytes,
+                self.file_transfer_max_entries,
+            )
+        });
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
             remote_formats: Vec::new(),
@@ -103,6 +131,9 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             running,
             last_requested_format: None,
             pending_echo_candidate: None,
+            file_transfer_mode: self.file_transfer_mode,
+            files,
+            file_worker,
         })
     }
 }
@@ -120,6 +151,9 @@ struct HyprCliprdrBackend {
     running: Arc<AtomicBool>,
     last_requested_format: Option<ClipboardFormatId>,
     pending_echo_candidate: Option<ClipboardEchoCandidate>,
+    file_transfer_mode: FileTransferMode,
+    files: FrozenFiles,
+    file_worker: Option<FileWorker>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -148,7 +182,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+        let mut capabilities = ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES;
+        if self.file_transfer_mode.permits_to_client() {
+            capabilities |= ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+                | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
+        }
+        capabilities
     }
 
     fn on_ready(&mut self) {
@@ -157,27 +197,12 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_request_format_list(&mut self) {
-        let mut formats = Vec::new();
-
-        let has_text = self
-            .clipboard_data
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|d| !d.is_empty()))
-            .unwrap_or(false);
-        if has_text {
-            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
-        }
-
-        let has_image = self
-            .clipboard_image
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|d| !d.is_empty()))
-            .unwrap_or(false);
-        if has_image {
-            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
-        }
+        let formats: Vec<ClipboardFormat> = SelectionKind::ALL
+            .into_iter()
+            .filter(|kind| self.has_local_selection(*kind))
+            .filter_map(Self::local_format_for_kind)
+            .map(ClipboardFormat::new)
+            .collect();
 
         if !formats.is_empty() {
             if let Some(ref sender) = self.event_sender {
@@ -190,12 +215,33 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 );
             }
         }
+        if file_stream_enabled(&self.files) {
+            if let Some(files) = self
+                .files
+                .lock()
+                .ok()
+                .and_then(|files| files.entries.clone())
+            {
+                if let Some(sender) = &self.event_sender {
+                    let descriptors = files.into_iter().map(|file| file.descriptor).collect();
+                    let _ = sender.send(ServerEvent::Clipboard(
+                        ClipboardMessage::SendInitiateFileCopy(descriptors),
+                    ));
+                }
+            }
+        }
     }
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        set_file_capabilities(
+            &self.files,
+            self.file_transfer_mode.permits_to_client()
+                && capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
+            capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
+        );
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -204,32 +250,16 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
+        clear_selection(&self.files);
         let echo_candidate = self
             .echo_candidate
             .lock()
             .ok()
             .and_then(|mut candidate| candidate.take());
 
-        let has_unicode = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT);
-        let has_dibv5 = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_DIBV5);
-        let has_dib = available_formats
-            .iter()
-            .any(|f| f.id == ClipboardFormatId::CF_DIB);
-
-        // Prefer text over image; prefer CF_DIBV5 over CF_DIB (better BITFIELDS support)
-        let format = if has_unicode {
-            Some(ClipboardFormatId::CF_UNICODETEXT)
-        } else if has_dibv5 {
-            Some(ClipboardFormatId::CF_DIBV5)
-        } else if has_dib {
-            Some(ClipboardFormatId::CF_DIB)
-        } else {
-            None
-        };
+        let format = SelectionKind::REMOTE_PREFERENCE
+            .into_iter()
+            .find_map(|kind| Self::remote_format_for_kind(kind, available_formats));
 
         let Some(format) = format else {
             self.last_requested_format = None;
@@ -253,25 +283,31 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        let response = if request.format == ClipboardFormatId::CF_UNICODETEXT {
-            let data = self.clipboard_data.lock().ok().and_then(|g| g.clone());
-            match data {
-                Some(ref data) if !data.is_empty() => {
-                    let text = String::from_utf8_lossy(data);
-                    FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
+        let response = match Self::local_kind_for_format(request.format) {
+            Some(SelectionKind::Text) => {
+                let data = self.clipboard_data.lock().ok().and_then(|g| g.clone());
+                match data {
+                    Some(ref data) if !data.is_empty() => {
+                        let text = String::from_utf8_lossy(data);
+                        FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
+                    }
+                    _ => FormatDataResponse::new_error().into_owned(),
                 }
-                _ => FormatDataResponse::new_error().into_owned(),
             }
-        } else if request.format == ClipboardFormatId::CF_DIB {
-            let data = self.clipboard_image.lock().ok().and_then(|g| g.clone());
-            match data {
-                Some(dib_data) if !dib_data.is_empty() => {
-                    FormatDataResponse::new_data(dib_data).into_owned()
+            Some(SelectionKind::Image) => {
+                let data = self.clipboard_image.lock().ok().and_then(|g| g.clone());
+                match data {
+                    Some(dib_data) if !dib_data.is_empty() => {
+                        FormatDataResponse::new_data(dib_data).into_owned()
+                    }
+                    _ => FormatDataResponse::new_error().into_owned(),
                 }
-                _ => FormatDataResponse::new_error().into_owned(),
             }
-        } else {
-            FormatDataResponse::new_error().into_owned()
+            Some(SelectionKind::Files) => {
+                tracing::trace!("Clipboard: file selection support is not enabled yet");
+                FormatDataResponse::new_error().into_owned()
+            }
+            None => FormatDataResponse::new_error().into_owned(),
         };
 
         if let Some(ref sender) = self.event_sender {
@@ -285,9 +321,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
         self.handle_format_data_response(response, MAX_CLIPBOARD_SIZE);
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        if let Some(worker) = self.to_client_worker() {
+            worker.read(request);
+            return;
+        }
+        if let Some(sender) = &self.event_sender {
+            let _ = sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(
+                    request.stream_id,
+                )),
+            ));
+        }
+    }
 
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {
+        // This server never asks the client for file contents: the direction
+        // that does is not part of this change.
+    }
 
     fn on_lock(&mut self, _data_id: LockDataId) {}
 
@@ -295,6 +346,66 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    /// The file worker, but only while this session may copy files to the client.
+    fn to_client_worker(&self) -> Option<&FileWorker> {
+        self.file_worker
+            .as_ref()
+            .filter(|_| file_stream_enabled(&self.files))
+    }
+
+    fn has_local_selection(&self, kind: SelectionKind) -> bool {
+        match kind {
+            SelectionKind::Text => self
+                .clipboard_data
+                .lock()
+                .ok()
+                .and_then(|data| data.as_ref().map(|data| !data.is_empty()))
+                .unwrap_or(false),
+            SelectionKind::Image => self
+                .clipboard_image
+                .lock()
+                .ok()
+                .and_then(|data| data.as_ref().map(|data| !data.is_empty()))
+                .unwrap_or(false),
+            SelectionKind::Files => false,
+        }
+    }
+
+    fn local_format_for_kind(kind: SelectionKind) -> Option<ClipboardFormatId> {
+        match kind {
+            SelectionKind::Text => Some(ClipboardFormatId::CF_UNICODETEXT),
+            SelectionKind::Image => Some(ClipboardFormatId::CF_DIB),
+            SelectionKind::Files => None,
+        }
+    }
+
+    fn local_kind_for_format(format: ClipboardFormatId) -> Option<SelectionKind> {
+        match format {
+            ClipboardFormatId::CF_UNICODETEXT => Some(SelectionKind::Text),
+            ClipboardFormatId::CF_DIB => Some(SelectionKind::Image),
+            _ => None,
+        }
+    }
+
+    fn remote_format_for_kind(
+        kind: SelectionKind,
+        formats: &[ClipboardFormat],
+    ) -> Option<ClipboardFormatId> {
+        let has_format = |id| formats.iter().any(|format| format.id == id);
+        match kind {
+            SelectionKind::Text => has_format(ClipboardFormatId::CF_UNICODETEXT)
+                .then_some(ClipboardFormatId::CF_UNICODETEXT),
+            SelectionKind::Image => {
+                if has_format(ClipboardFormatId::CF_DIBV5) {
+                    Some(ClipboardFormatId::CF_DIBV5)
+                } else {
+                    has_format(ClipboardFormatId::CF_DIB).then_some(ClipboardFormatId::CF_DIB)
+                }
+            }
+            SelectionKind::Files => None,
+        }
+    }
+
     fn handle_format_data_response(
         &mut self,
         response: FormatDataResponse<'_>,
@@ -405,23 +516,23 @@ impl HyprCliprdrBackend {
             None => return,
         };
 
-        let clipboard_data = Arc::clone(&self.clipboard_data);
-        let clipboard_image = Arc::clone(&self.clipboard_image);
-        let pending_write = Arc::clone(&self.pending_write);
-        let echo_candidate = Arc::clone(&self.echo_candidate);
         let running = Arc::clone(&self.running);
+        let shared = ClipboardShared {
+            event_sender: sender,
+            clipboard_data: Arc::clone(&self.clipboard_data),
+            clipboard_image: Arc::clone(&self.clipboard_image),
+            pending_write: Arc::clone(&self.pending_write),
+            echo_candidate: Arc::clone(&self.echo_candidate),
+            file_selection: FileSelection::new(
+                Arc::clone(&self.files),
+                self.to_client_worker().map(|worker| worker.handle()),
+            ),
+        };
 
         match thread::Builder::new()
             .name("clipboard-watcher".into())
             .spawn(move || {
-                if let Err(e) = clipboard_thread(
-                    sender,
-                    clipboard_data,
-                    clipboard_image,
-                    pending_write,
-                    echo_candidate,
-                    running,
-                ) {
+                if let Err(e) = clipboard_thread(shared, running) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
             }) {
@@ -439,8 +550,11 @@ impl HyprCliprdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileDescriptor};
     use proptest::prelude::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::Duration;
 
     const ONE_BY_ONE_RGBA_PNG: &[u8] = &[
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
@@ -464,6 +578,9 @@ mod tests {
                 running: Arc::new(AtomicBool::new(true)),
                 last_requested_format: None,
                 pending_echo_candidate: None,
+                file_transfer_mode: FileTransferMode::ToClient,
+                files: Arc::new(Mutex::new(None.into())),
+                file_worker: None,
             },
             event_rx,
         )
@@ -473,6 +590,296 @@ mod tests {
         let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         bytes.extend_from_slice(&[0, 0]);
         bytes
+    }
+
+    fn recv_file_response(
+        event_rx: &mut mpsc::UnboundedReceiver<ServerEvent>,
+    ) -> FileContentsResponse<'static> {
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsResponse(response))) =
+            event_rx.blocking_recv()
+        else {
+            panic!("expected file response");
+        };
+        response
+    }
+
+    #[test]
+    fn file_request_callback_serves_and_refuses_frozen_file_ranges() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-file-callback-{}", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"clipboard bytes")
+            .unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(
+            Some(super::super::files::freeze_regular_files(
+                vec![path.clone()],
+            ))
+            .into(),
+        ));
+        let worker = FileWorker::start(Arc::clone(&files), event_tx.clone(), 8, 100);
+        let mut backend = HyprCliprdrBackend {
+            event_sender: Some(event_tx),
+            remote_formats: Vec::new(),
+            watcher_thread: None,
+            clipboard_data: Arc::new(Mutex::new(None)),
+            clipboard_image: Arc::new(Mutex::new(None)),
+            pending_write: Arc::new(Mutex::new(None)),
+            echo_candidate: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(true)),
+            last_requested_format: None,
+            pending_echo_candidate: None,
+            file_transfer_mode: FileTransferMode::ToClient,
+            files,
+            file_worker: Some(worker),
+        };
+
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 9,
+            index: 0,
+            flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+            position: 10,
+            requested_size: 8,
+            data_id: None,
+        });
+
+        let response = recv_file_response(&mut event_rx);
+        assert_eq!(response.stream_id(), 9);
+        assert_eq!(response.data(), b"bytes");
+
+        for request in [
+            FileContentsRequest {
+                stream_id: 10,
+                index: 1,
+                flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 1,
+                data_id: None,
+            },
+            FileContentsRequest {
+                stream_id: 11,
+                index: 0,
+                flags: ironrdp_cliprdr::pdu::FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 9,
+                data_id: None,
+            },
+        ] {
+            backend.on_file_contents_request(request);
+            assert!(recv_file_response(&mut event_rx).is_error());
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 12,
+            index: 0,
+            flags: ironrdp_cliprdr::pdu::FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        });
+        assert!(recv_file_response(&mut event_rx).is_error());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Builds a directory tree carrying every enumeration hazard ticket 04
+    /// names: an empty directory, a symlink to a file, a symlink cycle back to
+    /// the root, a FIFO, and a socket. Enumerating `root` must yield exactly the
+    /// root, `nested`, `nested/empty`, `nested/document.txt`, and
+    /// `nested/shortcut.txt`.
+    ///
+    /// Returns the bound socket, which the caller must keep alive for the walk.
+    fn build_hazardous_tree(root: &std::path::Path) -> std::os::unix::net::UnixDatagram {
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+        std::fs::File::create(root.join("nested/document.txt"))
+            .unwrap()
+            .write_all(b"contents")
+            .unwrap();
+        std::os::unix::fs::symlink(root, root.join("nested/loop")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("nested/document.txt"),
+            root.join("nested/shortcut.txt"),
+        )
+        .unwrap();
+        let fifo = std::ffi::CString::new(
+            root.join("nested/ignored-fifo")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::net::UnixDatagram::bind(root.join("nested/ignored-socket")).unwrap()
+    }
+
+    #[test]
+    fn file_worker_offers_a_bounded_directory_tree() {
+        let root =
+            std::env::temp_dir().join(format!("hypr-rdp-file-worker-{}", std::process::id()));
+        let socket = build_hazardous_tree(&root);
+
+        let (mut backend, mut events) = backend_with_events();
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            10,
+        );
+        assert!(
+            FileSelection::new(Arc::clone(&backend.files), Some(worker.handle()))
+                .freeze(vec![root.clone()])
+        );
+
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the file offer");
+        };
+        let decoded = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
+        let root_name = root.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                root_name,
+                &format!("{root_name}\\nested"),
+                &format!("{root_name}\\nested\\empty"),
+                &format!("{root_name}\\nested\\document.txt"),
+                &format!("{root_name}\\nested\\shortcut.txt"),
+            ]
+        );
+        // Directories arrive as directories and carry no content length; the
+        // symlink arrives as the file it points at.
+        assert_eq!(
+            decoded
+                .files
+                .iter()
+                .map(|descriptor| (descriptor.attributes, descriptor.file_size))
+                .collect::<Vec<_>>(),
+            [
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::DIRECTORY), None),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
+                (Some(ClipboardFileAttributes::NORMAL), Some(8)),
+            ]
+        );
+
+        drop(worker);
+
+        let worker = FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            1024,
+            3,
+        );
+        assert!(
+            FileSelection::new(Arc::clone(&backend.files), Some(worker.handle()))
+                .freeze(vec![root.clone()])
+        );
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the worker to freeze a truncated file offer");
+        };
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected the backend to re-advertise the truncated file offer");
+        };
+        let truncated = FormatDataResponse::new_file_list(&PackedFileList { files: descriptors })
+            .unwrap()
+            .to_file_list()
+            .unwrap();
+        // The work budget counts inspected entries, including skipped sockets
+        // and cycles. Which child survives depends on read_dir order.
+        assert!((2..=3).contains(&truncated.files.len()));
+        assert_eq!(truncated.files[0].name, root_name);
+        assert_eq!(truncated.files[1].name, format!("{root_name}\\nested"));
+
+        drop(worker);
+        drop(socket);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_offer_adjusts_names_that_windows_would_reject_without_dropping_them() {
+        let (mut backend, mut events) = backend_with_events();
+        let root = std::env::temp_dir().join(format!(
+            "hypr-rdp-name-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let paths = [
+            "a:b".into(),
+            "a?b".into(),
+            "CON.txt".into(),
+            "trailing. ".into(),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ]
+        .into_iter()
+        .map(|name: std::ffi::OsString| {
+            let path = root.join(name);
+            std::fs::File::create(&path).unwrap();
+            path
+        })
+        .collect();
+        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_paths(paths, 100));
+
+        backend.on_request_format_list();
+
+        let descriptors = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for file offer")
+                    .expect("backend stopped before offering files");
+                let ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors)) =
+                    event
+                else {
+                    panic!("expected a file offer");
+                };
+                descriptors
+            });
+        let decoded: Vec<FileDescriptor> = descriptors
+            .iter()
+            .map(|descriptor| {
+                ironrdp_core::decode(&ironrdp_core::encode_vec(descriptor).unwrap()).unwrap()
+            })
+            .collect();
+
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a_b", "a_b (2)", "CON_.txt", "trailing", "�"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1022,5 +1429,55 @@ mod tests {
             }
             prop_assert_eq!(backend.last_requested_format, None);
         }
+    }
+
+    #[test]
+    fn negotiated_file_policy_preserves_text_and_respects_config_off() {
+        let (mut backend, mut events) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"still text".to_vec());
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        );
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats))) =
+            events.blocking_recv()
+        else {
+            panic!("text offer missing");
+        };
+        assert_eq!(formats[0].id, ClipboardFormatId::CF_UNICODETEXT);
+        assert!(events.try_recv().is_err());
+        let full = ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
+        backend.on_process_negotiated_capabilities(full);
+        assert!(file_stream_enabled(&backend.files));
+        backend.file_transfer_mode = FileTransferMode::Off;
+        backend.on_process_negotiated_capabilities(full);
+        assert!(!file_stream_enabled(&backend.files));
+    }
+
+    #[test]
+    fn peer_without_file_streaming_does_not_get_file_offer() {
+        let (mut backend, mut events) = backend_with_events();
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        );
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-review-caps-{}", std::process::id()));
+        std::fs::write(&path, b"file").unwrap();
+        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_regular_files(
+            vec![path.clone()],
+        ));
+        backend.on_request_format_list();
+        let event = events.try_recv();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            !matches!(
+                event,
+                Ok(ServerEvent::Clipboard(
+                    ClipboardMessage::SendInitiateFileCopy(_)
+                ))
+            ),
+            "file offer emitted although the peer negotiated text/image only"
+        );
     }
 }
