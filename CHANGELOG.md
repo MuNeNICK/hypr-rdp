@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced FFmpeg with bundled OpenH264 for software H.264 encoding. AVC420 retains native VA-API acceleration; experimental AVC444 currently uses software encoding.
+
 ### Added
 
 - Enabled upstream authenticated session replacement for connections with configured NLA credentials; TLS-only connections retain their existing queue policy.

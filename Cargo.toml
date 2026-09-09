@@ -26,8 +26,8 @@ ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198
 ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
 ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
 
-# H.264 encoding (FFmpeg/libavcodec software encoder)
-ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format"] }
+# H.264 software codec compiled into the binary.
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
 yuv = "0.8.14"
 
 # Async runtime
@@ -70,6 +70,5 @@ rustls = { version = "0.23", default-features = false }
 url = "2"
 
 [dev-dependencies]
-openh264 = { version = "0.9", features = ["libloading"] }
 png = "0.18.1"
 proptest = "1"
