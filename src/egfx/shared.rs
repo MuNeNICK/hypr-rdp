@@ -70,6 +70,7 @@ impl EgfxFrameReadiness {
 
 /// Shared EGFX state accessible from factory, handler, and capture thread.
 pub struct EgfxShared {
+    pub(in crate::egfx) clearcodec: Mutex<super::clearcodec::ClearCodecState>,
     /// The GFX server handle (set once during build_server_with_handle)
     pub(in crate::egfx) handle: Mutex<Option<GfxServerHandle>>,
     /// Whether EGFX capability negotiation is complete
@@ -132,6 +133,7 @@ impl EgfxShared {
             gfx_wait_started: Mutex::new(None),
             gfx_ever_ready: AtomicBool::new(false),
             gfx_fallback_logged: AtomicBool::new(false),
+            clearcodec: Mutex::new(Default::default()),
             codec_policy,
         }
     }
@@ -407,6 +409,9 @@ impl EgfxShared {
         self.force_full_frame.store(false, Ordering::Release);
         self.clear_current_surface();
         self.reset_frame_queue_for_new_client();
+        if let Ok(mut encoder) = self.clearcodec.lock() {
+            *encoder = Default::default();
+        }
     }
 }
 

@@ -23,7 +23,7 @@ const FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Common frame processing: EGFX H.264/RFX encoding or bitmap fallback.
+/// Common frame processing: EGFX AVC/ClearCodec encoding or bitmap fallback.
 pub(super) struct FrameProcessor {
     egfx_shared: Option<Arc<EgfxShared>>,
     pub(super) h264_encoder: Option<crate::egfx::FrameEncoder>,
@@ -69,11 +69,12 @@ pub(super) struct FrameStats {
     bytes: u64,
     encode_us_total: u128,
     send_us_total: u128,
+    clearcodec_process_us_total: u128,
     damage_pixels: u64,
     capture_damage_regions: u32,
     promoted_full_scans: u32,
     damage_regions: u32,
-    last_codec: Option<EgfxCodec>,
+    last_codec: Option<FrameStatsCodec>,
     last_surface_id: Option<u16>,
     last_frame_id: u32,
     last_acked_frame_id: u32,
@@ -85,10 +86,26 @@ pub(super) struct FrameStats {
     total_acked_frames: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FrameStatsCodec {
+    Avc420,
+    Avc444,
+    ClearCodec,
+}
+
+impl From<EgfxCodec> for FrameStatsCodec {
+    fn from(codec: EgfxCodec) -> Self {
+        match codec {
+            EgfxCodec::Avc420 => Self::Avc420,
+            EgfxCodec::Avc444 => Self::Avc444,
+        }
+    }
+}
+
 struct SentFrameStats<'a> {
     width: u32,
     height: u32,
-    codec: EgfxCodec,
+    codec: FrameStatsCodec,
     surface_id: u16,
     damage_regions: &'a [(i32, i32, i32, i32)],
     bytes: usize,
@@ -123,6 +140,7 @@ impl FrameStats {
             bytes: 0,
             encode_us_total: 0,
             send_us_total: 0,
+            clearcodec_process_us_total: 0,
             damage_pixels: 0,
             capture_damage_regions: 0,
             promoted_full_scans: 0,
@@ -274,6 +292,7 @@ impl FrameStats {
                 captured_fps = self.captured_frames as f64 / seconds,
                 fps = self.sent_frames as f64 / seconds,
                 last_codec = ?self.last_codec,
+                clearcodec_process_ms = self.clearcodec_process_us_total as f64 / 1000.0,
                 last_surface_id = ?self.last_surface_id,
                 last_frame_id = self.last_frame_id,
                 last_acked_frame_id = self.last_acked_frame_id,
@@ -494,6 +513,115 @@ impl FrameProcessor {
         }
     }
 
+    fn process_clearcodec(&mut self, data: &[u8]) -> bool {
+        let shared = self.egfx_shared.as_ref().expect("ClearCodec requires EGFX");
+        let generation = shared.generation();
+        if generation != self.egfx_generation || self.h264_encoder.is_some() {
+            self.egfx_generation = generation;
+            self.h264_encoder = None;
+            self.egfx_codec = None;
+            self.egfx_active = false;
+            self.egfx_surface_id = None;
+            self.sent_first_frame = false;
+            self.damage_detector.invalidate();
+        }
+        let Some(handle) = shared.get_handle() else {
+            return true;
+        };
+        let Some(sender) = shared.get_event_sender() else {
+            return true;
+        };
+        if sender.is_closed() {
+            return false;
+        }
+        let readiness = if shared.full_frame_requested() {
+            shared.full_frame_refresh_readiness()
+        } else {
+            shared.frame_readiness(&handle)
+        };
+        if !readiness.is_ready() {
+            self.stats.record_send_unavailable(
+                readiness,
+                shared.frame_flow_snapshot(),
+                self.width,
+                self.height,
+            );
+            return true;
+        }
+        let (Ok(width), Ok(height)) = (u16::try_from(self.width), u16::try_from(self.height))
+        else {
+            return false;
+        };
+        let full_refresh = shared.full_frame_requested() || !self.sent_first_frame;
+        let damage = if full_refresh {
+            vec![(0, 0, self.width as i32, self.height as i32)]
+        } else {
+            self.damage_detector.detect(
+                data,
+                self.width,
+                self.height,
+                self.stride as usize,
+                &self.pending_damage_regions,
+            )
+        };
+        if damage.is_empty() {
+            self.pending_damage_regions.clear();
+            return true;
+        }
+        let Some(surface_id) = shared.init_or_reuse_surface(&handle, &sender, width, height) else {
+            return true;
+        };
+        let process_start = Instant::now();
+        match shared.send_clearcodec_damage(
+            &handle,
+            &sender,
+            surface_id,
+            data,
+            width,
+            height,
+            self.stride as usize,
+            &damage,
+            0,
+            self.pixel_format,
+        ) {
+            Ok(Some(bytes)) => {
+                self.sent_first_frame = true;
+                self.egfx_surface_id = Some(surface_id);
+                self.damage_detector.update_reference_regions(
+                    data,
+                    self.width,
+                    self.height,
+                    self.stride as usize,
+                    &damage,
+                );
+                self.pending_damage_regions.clear();
+                shared.take_full_frame_request();
+                // The ClearCodec API combines encode and enqueue in one transaction.
+                self.stats.clearcodec_process_us_total = self
+                    .stats
+                    .clearcodec_process_us_total
+                    .saturating_add(process_start.elapsed().as_micros());
+                self.stats.record_sent(SentFrameStats {
+                    width: self.width,
+                    height: self.height,
+                    codec: FrameStatsCodec::ClearCodec,
+                    surface_id,
+                    damage_regions: &damage,
+                    bytes,
+                    encode_elapsed: Duration::ZERO,
+                    send_elapsed: Duration::ZERO,
+                    flow: shared.frame_flow_snapshot(),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "ClearCodec frame failed; ending capture session");
+                return false;
+            }
+        }
+        true
+    }
+
     /// Process a captured frame. Returns true if the capture loop should continue.
     pub(super) fn process(&mut self, data: &[u8], tx: &mpsc::Sender<DisplayUpdate>) -> bool {
         self.process_at(data, tx, Instant::now())
@@ -527,6 +655,14 @@ impl FrameProcessor {
                 }
                 return false;
             }
+        }
+
+        if self
+            .egfx_shared
+            .as_ref()
+            .is_some_and(|shared| shared.is_ready() && !shared.is_avc_enabled())
+        {
+            return self.process_clearcodec(data);
         }
 
         let mut sent_via_egfx = false;
@@ -762,7 +898,7 @@ impl FrameProcessor {
                                     self.stats.record_sent(SentFrameStats {
                                         width: self.width,
                                         height: self.height,
-                                        codec,
+                                        codec: codec.into(),
                                         surface_id: sid,
                                         damage_regions: &frame_damage_regions,
                                         bytes: encoded.len(),
@@ -856,8 +992,7 @@ impl FrameProcessor {
                 }
             }
 
-            // RFX-over-EGFX is not available through the current server API.
-            // AVC-disabled clients fall through to bitmap fallback below.
+            // Non-AVC EGFX is handled by process_clearcodec before the AVC path.
         }
 
         if sent_via_egfx {
@@ -914,9 +1049,9 @@ mod tests {
     use crate::display::geometry::{PresentationGeometry, Size};
     use crate::egfx::test_support::{
         ack_frame, drain_gfx_pdus, negotiated_avc444_egfx, negotiated_egfx_with_policy,
-        negotiated_no_avc_egfx, process_avc444_capabilities, start_gfx_channel,
-        tracked_avc444_session, unnegotiated_egfx_shared, Avc444PresentationOracle,
-        ExpectedAvc444Encoding, TestQueueDepth,
+        negotiated_no_avc_egfx, negotiated_no_avc_session, process_avc444_capabilities,
+        start_gfx_channel, tracked_avc444_session, unnegotiated_egfx_shared,
+        Avc444PresentationOracle, ClearCodecFrameOracle, ExpectedAvc444Encoding, TestQueueDepth,
     };
     use crate::egfx::{
         EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
@@ -1508,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_processor_sends_bitmap_when_egfx_client_has_no_avc() {
+    fn frame_processor_sends_clearcodec_when_egfx_client_has_no_avc() {
         let width = 16;
         let height = 16;
         let stride = width * 4;
@@ -1532,15 +1667,232 @@ mod tests {
         assert!(processor.process(&frame, &display_tx));
         assert!(processor.sent_first_frame);
         assert!(processor.pending_damage_regions.is_empty());
-        drain_gfx_pdus(&mut event_rx).assert_empty();
-        assert_bitmap_update(
-            &mut display_rx,
+        let trace = drain_gfx_pdus(&mut event_rx);
+        trace.assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
+        ClearCodecFrameOracle::new().assert_frame(
+            &trace,
+            processor.egfx_surface_id.unwrap(),
+            &frame,
             width,
             height,
             stride,
-            PixelFormat::BgrA32,
-            &frame,
+            &[(0, 0, width as i32, height as i32)],
         );
+        assert!(display_rx.try_recv().is_err());
+        assert_eq!(processor.stats.sent_frames, 1);
+        assert!(matches!(
+            processor.stats.last_codec,
+            Some(FrameStatsCodec::ClearCodec)
+        ));
+    }
+
+    fn clearcodec_processor(
+        shared: Arc<EgfxShared>,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> FrameProcessor {
+        FrameProcessor::new(
+            Some(shared),
+            width,
+            height,
+            PixelFormat::BgrA32,
+            stride,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        )
+    }
+
+    #[test]
+    fn clearcodec_capture_formats_decode_to_expected_rgb_with_padded_stride() {
+        let expected = [
+            10, 20, 200, 255, 30, 40, 150, 255, 0, 0, 0, 0, 50, 60, 100, 255, 70, 80, 250, 255, 0,
+            0, 0, 0,
+        ];
+        let bgr = [
+            10, 20, 200, 0, 30, 40, 150, 19, 99, 99, 99, 99, 50, 60, 100, 50, 70, 80, 250, 100, 99,
+            99, 99, 99,
+        ];
+        let rgb = [
+            200, 20, 10, 0, 150, 40, 30, 19, 99, 99, 99, 99, 100, 60, 50, 50, 250, 80, 70, 100, 99,
+            99, 99, 99,
+        ];
+        for (format, source) in [
+            (PixelFormat::BgrA32, bgr),
+            (PixelFormat::BgrX32, bgr),
+            (PixelFormat::RgbA32, rgb),
+            (PixelFormat::RgbX32, rgb),
+        ] {
+            let mut session = negotiated_no_avc_session(2, 2);
+            let mut processor = clearcodec_processor(Arc::clone(&session.shared), 2, 2, 12);
+            processor.pixel_format = format;
+            let (display_tx, mut display_rx) = mpsc::channel(4);
+            processor.queue_damage(&[(0, 0, 2, 2)]);
+            assert!(processor.process(&source, &display_tx), "format {format:?}");
+            ClearCodecFrameOracle::new().assert_frame(
+                &drain_gfx_pdus(&mut session.event_rx),
+                processor.egfx_surface_id.unwrap(),
+                &expected,
+                2,
+                2,
+                12,
+                &[(0, 0, 2, 2)],
+            );
+            assert!(display_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn clearcodec_capture_invalid_input_or_closed_transport_keeps_damage_uncommitted() {
+        for case in 0..4 {
+            let mut session = negotiated_no_avc_session(16, 16);
+            let mut processor = clearcodec_processor(Arc::clone(&session.shared), 16, 16, 64);
+            let mut frame = vec![31; 16 * 16 * 4];
+            match case {
+                0 => frame.truncate(12),
+                1 => processor.stride = 63,
+                2 => processor.pixel_format = PixelFormat::ARgb32,
+                _ => session.event_rx.close(),
+            }
+            let (display_tx, mut display_rx) = mpsc::channel(4);
+            processor.queue_damage(&[(0, 0, 16, 16)]);
+            assert!(!processor.process(&frame, &display_tx));
+            assert!(!processor.sent_first_frame);
+            assert!(!processor.pending_damage_regions.is_empty());
+            assert_eq!(processor.stats.sent_frames, 0);
+            assert_eq!(session.shared.frame_flow_snapshot().total_queued_frames, 0);
+            drain_gfx_pdus(&mut session.event_rx).assert_no_encoded_frame();
+            assert!(display_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn clearcodec_capture_retains_damage_under_backpressure_and_resumes_after_ack() {
+        let mut session = negotiated_no_avc_session(160, 80);
+        let mut processor = clearcodec_processor(Arc::clone(&session.shared), 160, 80, 648);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let mut oracle = ClearCodecFrameOracle::new();
+        let mut frame = vec![0; 648 * 80];
+        let full = [(0, 0, 160, 80)];
+        processor.queue_damage(&full);
+        assert!(processor.process(&frame, &display_tx));
+        let sid = processor.egfx_surface_id.unwrap();
+        let id = oracle.assert_frame(
+            &drain_gfx_pdus(&mut session.event_rx),
+            sid,
+            &frame,
+            160,
+            80,
+            648,
+            &full,
+        );
+        ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+
+        let damage = [(1, 2, 4, 5), (130, 20, 5, 5)];
+        // Fill the ACK window with distinct frames; the oracle decodes every payload.
+        let mut last_id = id;
+        for value in 1..=DEFAULT_MAX_FRAMES_IN_FLIGHT {
+            frame[2 * 648 + 4] = value as u8;
+            frame[20 * 648 + 130 * 4] = value as u8;
+            processor.queue_damage(&damage);
+            assert!(processor.process(&frame, &display_tx));
+            last_id = oracle.assert_frame(
+                &drain_gfx_pdus(&mut session.event_rx),
+                sid,
+                &frame,
+                160,
+                80,
+                648,
+                &damage,
+            );
+        }
+        assert_eq!(
+            session.shared.frame_flow_snapshot().frames_in_flight,
+            DEFAULT_MAX_FRAMES_IN_FLIGHT
+        );
+        frame[2 * 648 + 4] = 99;
+        frame[20 * 648 + 130 * 4] = 99;
+        processor.queue_damage(&damage);
+        let sent = processor.stats.sent_frames;
+        assert!(processor.process(&frame, &display_tx));
+        drain_gfx_pdus(&mut session.event_rx).assert_empty();
+        assert_eq!(processor.stats.sent_frames, sent);
+        assert!(!processor.pending_damage_regions.is_empty());
+        ack_frame(
+            &mut session.bridge,
+            last_id,
+            TestQueueDepth::AvailableBytes(0),
+        );
+        assert!(processor.process(&frame, &display_tx));
+        let id = oracle.assert_frame(
+            &drain_gfx_pdus(&mut session.event_rx),
+            sid,
+            &frame,
+            160,
+            80,
+            648,
+            &damage,
+        );
+        ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+        assert!(processor.pending_damage_regions.is_empty());
+        assert_eq!(processor.stats.sent_frames, sent + 1);
+        // Unchanged candidates must not keep producing frames after reference commit.
+        processor.queue_damage(&damage);
+        assert!(processor.process(&frame, &display_tx));
+        drain_gfx_pdus(&mut session.event_rx).assert_empty();
+        assert!(display_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn clearcodec_capture_rebuild_resize_and_full_refresh_preserve_session_sequence() {
+        let mut session = negotiated_no_avc_session(16, 16);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let mut oracle = ClearCodecFrameOracle::new();
+        for (index, width) in [16, 16, 24].into_iter().enumerate() {
+            if index == 2 {
+                session.shared.prepare_for_resize(width, 16);
+            }
+            let mut processor = clearcodec_processor(
+                Arc::clone(&session.shared),
+                width.into(),
+                16,
+                u32::from(width) * 4,
+            );
+            let frame = vec![index as u8; usize::from(width) * 16 * 4];
+            let full = [(0, 0, i32::from(width), 16)];
+            processor.queue_damage(&full);
+            assert!(processor.process(&frame, &display_tx));
+            let sid = processor.egfx_surface_id.unwrap();
+            let id = oracle.assert_frame(
+                &drain_gfx_pdus(&mut session.event_rx),
+                sid,
+                &frame,
+                width.into(),
+                16,
+                usize::from(width) * 4,
+                &full,
+            );
+            session.shared.request_full_frame();
+            assert!(processor.process(&frame, &display_tx));
+            drain_gfx_pdus(&mut session.event_rx).assert_empty();
+            assert!(session.shared.full_frame_requested());
+            ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+            assert!(processor.process(&frame, &display_tx));
+            let id = oracle.assert_frame(
+                &drain_gfx_pdus(&mut session.event_rx),
+                sid,
+                &frame,
+                width.into(),
+                16,
+                usize::from(width) * 4,
+                &full,
+            );
+            ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+            assert!(!session.shared.full_frame_requested());
+        }
+        assert!(display_rx.try_recv().is_err());
     }
 
     #[test]

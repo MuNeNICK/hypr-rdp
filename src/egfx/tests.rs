@@ -1390,3 +1390,420 @@ fn avc420_region_preserves_rect16_bounds_and_quant_quality() {
     assert!(!quant.progressive);
     assert_eq!(quant.quality, 81);
 }
+
+#[test]
+fn clearcodec_sparse_wire_frame_preserves_pixels_and_one_ack_slot() {
+    use super::test_support::{negotiated_no_avc_session, ClearCodecFrameOracle};
+    let mut session = negotiated_no_avc_session(160, 80);
+    let sid = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 160, 80)
+        .unwrap();
+    let stride = 160 * 4 + 7;
+    let data: Vec<_> = (0..stride * 80).map(|i| (i % 251) as u8).collect();
+    let damage = [(-4, 2, 8, 5), (100, 20, 90, 12), (102, 22, 3, 5)];
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            160,
+            80,
+            stride,
+            &damage,
+            123,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_some());
+    let trace = drain_gfx_pdus(&mut session.event_rx);
+    let id =
+        ClearCodecFrameOracle::new().assert_frame(&trace, sid, &data, 160, 80, stride, &damage);
+    assert_eq!(session.shared.frames_in_flight(), 1);
+    assert_eq!(session.handle.lock().unwrap().frames_in_flight(), 1);
+    ack_frame(&mut session.bridge, id, QueueDepth::AvailableBytes(0));
+    assert_eq!(session.shared.frames_in_flight(), 0);
+}
+
+#[test]
+fn clearcodec_preflight_failure_does_not_advance_sequence_or_queue() {
+    use super::test_support::{negotiated_no_avc_session, ClearCodecFrameOracle};
+    let mut session = negotiated_no_avc_session(16, 16);
+    let sid = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 16, 16)
+        .unwrap();
+    drain_gfx_pdus(&mut session.event_rx);
+    let data = vec![42; 16 * 16 * 4];
+    let damage = [(0, 0, 16, 16)];
+    let (closed, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &closed,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_none());
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data[..12],
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .is_err());
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            u16::MAX,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_none());
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            8,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .is_err());
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &[],
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(session.shared.frames_in_flight(), 0);
+    assert_eq!(session.handle.lock().unwrap().frames_in_flight(), 0);
+    drain_gfx_pdus(&mut session.event_rx).assert_empty();
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_some());
+    ClearCodecFrameOracle::new().assert_frame(
+        &drain_gfx_pdus(&mut session.event_rx),
+        sid,
+        &data,
+        16,
+        16,
+        64,
+        &damage,
+    );
+}
+
+#[test]
+fn clearcodec_sequence_wraps_survives_resize_and_resets_for_new_client() {
+    use super::test_support::{
+        negotiated_no_avc_session, process_no_avc_capabilities, start_gfx_channel,
+        ClearCodecFrameOracle,
+    };
+    use ironrdp_server::{GfxServerFactory, ServerEventSender};
+    let mut session = negotiated_no_avc_session(8, 8);
+    let mut oracle = ClearCodecFrameOracle::new();
+    let mut sid = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 8, 8)
+        .unwrap();
+    for frame in 0..260 {
+        if frame == 128 {
+            session.shared.prepare_for_resize(8, 8);
+            sid = session
+                .shared
+                .init_or_reuse_surface(&session.handle, &session.event_tx, 8, 8)
+                .unwrap();
+        }
+        let data = vec![frame as u8; 8 * 8 * 4];
+        assert!(session
+            .shared
+            .send_clearcodec_damage(
+                &session.handle,
+                &session.event_tx,
+                sid,
+                &data,
+                8,
+                8,
+                32,
+                &[(0, 0, 8, 8)],
+                0,
+                ironrdp_server::PixelFormat::BgrA32
+            )
+            .unwrap()
+            .is_some());
+        let id = oracle.assert_frame(
+            &drain_gfx_pdus(&mut session.event_rx),
+            sid,
+            &data,
+            8,
+            8,
+            32,
+            &[(0, 0, 8, 8)],
+        );
+        ack_frame(&mut session.bridge, id, QueueDepth::AvailableBytes(0));
+    }
+    let mut factory = HyprGfxFactory::new(Arc::clone(&session.shared));
+    factory.set_sender(session.event_tx.clone());
+    let (mut bridge, handle) = factory.build_server_with_handle().unwrap();
+    start_gfx_channel(&mut bridge);
+    process_no_avc_capabilities(&mut bridge);
+    let sid = session
+        .shared
+        .init_or_reuse_surface(&handle, &session.event_tx, 8, 8)
+        .unwrap();
+    let data = vec![99; 8 * 8 * 4];
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &handle,
+            &session.event_tx,
+            sid,
+            &data,
+            8,
+            8,
+            32,
+            &[(0, 0, 8, 8)],
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_some());
+    ClearCodecFrameOracle::new().assert_frame(
+        &drain_gfx_pdus(&mut session.event_rx),
+        sid,
+        &data,
+        8,
+        8,
+        32,
+        &[(0, 0, 8, 8)],
+    );
+    assert_eq!(session.shared.frames_in_flight(), 1);
+}
+
+#[test]
+fn clearcodec_negotiation_covers_v8_v81_and_avc_disabled_v10() {
+    use super::test_support::{start_gfx_channel, ClearCodecFrameOracle};
+    use ironrdp_egfx::pdu::{
+        CapabilitiesAdvertisePdu, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags,
+        CapabilitySet,
+    };
+    for capability in [
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        },
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::empty(),
+        },
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::AVC_DISABLED,
+        },
+    ] {
+        let mut session = unnegotiated_egfx_session(16, 16, EgfxCodecPolicy::Auto);
+        start_gfx_channel(&mut session.bridge);
+        let caps =
+            GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[capability]));
+        session
+            .bridge
+            .process(TEST_CHANNEL_ID, &encode_vec(&caps).unwrap())
+            .unwrap();
+        assert!(session.shared.is_ready());
+        assert!(!session.shared.is_avc_enabled());
+        let sid = session
+            .shared
+            .init_or_reuse_surface(&session.handle, &session.event_tx, 16, 16)
+            .unwrap();
+        let data = vec![31; 16 * 16 * 4];
+        assert!(session
+            .shared
+            .send_clearcodec_damage(
+                &session.handle,
+                &session.event_tx,
+                sid,
+                &data,
+                16,
+                16,
+                64,
+                &[(0, 0, 16, 16)],
+                0,
+                ironrdp_server::PixelFormat::BgrA32
+            )
+            .unwrap()
+            .is_some());
+        ClearCodecFrameOracle::new().assert_frame(
+            &drain_gfx_pdus(&mut session.event_rx),
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &[(0, 0, 16, 16)],
+        );
+    }
+}
+
+#[test]
+fn clearcodec_transport_backpressure_and_suspended_ack_preserve_sequence() {
+    use super::test_support::{negotiated_no_avc_session, ClearCodecFrameOracle};
+    let mut session = negotiated_no_avc_session(16, 16);
+    let sid = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 16, 16)
+        .unwrap();
+    session.handle.lock().unwrap().set_max_frames_in_flight(1);
+    let mut oracle = ClearCodecFrameOracle::new();
+    let data = vec![17; 16 * 16 * 4];
+    let damage = [(0, 0, 16, 16)];
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_some());
+    let id = oracle.assert_frame(
+        &drain_gfx_pdus(&mut session.event_rx),
+        sid,
+        &data,
+        16,
+        16,
+        64,
+        &damage,
+    );
+    assert!(!session.shared.should_backpressure_frames());
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(session.shared.frames_in_flight(), 1);
+    drain_gfx_pdus(&mut session.event_rx).assert_empty();
+    ack_frame(&mut session.bridge, id, QueueDepth::AvailableBytes(0));
+    assert!(session
+        .shared
+        .send_clearcodec_damage(
+            &session.handle,
+            &session.event_tx,
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+            0,
+            ironrdp_server::PixelFormat::BgrA32
+        )
+        .unwrap()
+        .is_some());
+    let id = oracle.assert_frame(
+        &drain_gfx_pdus(&mut session.event_rx),
+        sid,
+        &data,
+        16,
+        16,
+        64,
+        &damage,
+    );
+    ack_frame(&mut session.bridge, id, QueueDepth::Suspend);
+    for _ in 0..DEFAULT_MAX_FRAMES_IN_FLIGHT + 2 {
+        assert!(session
+            .shared
+            .send_clearcodec_damage(
+                &session.handle,
+                &session.event_tx,
+                sid,
+                &data,
+                16,
+                16,
+                64,
+                &damage,
+                0,
+                ironrdp_server::PixelFormat::BgrA32
+            )
+            .unwrap()
+            .is_some());
+        oracle.assert_frame(
+            &drain_gfx_pdus(&mut session.event_rx),
+            sid,
+            &data,
+            16,
+            16,
+            64,
+            &damage,
+        );
+    }
+}
