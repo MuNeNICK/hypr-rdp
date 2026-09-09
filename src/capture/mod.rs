@@ -511,12 +511,15 @@ impl HyprDisplay {
         Ok((Self { inner }, handle, dims))
     }
 
-    async fn request_initial_size_with(
+    async fn request_initial_size_with<Fut>(
         &mut self,
         client_size: DesktopSize,
-        mut resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()>,
-        mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
-    ) -> DesktopSize {
+        resize_headless: impl FnOnce(String, u32, u32, f64) -> Fut,
+        refresh_layout: impl FnOnce(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+    ) -> DesktopSize
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let requested_w = client_size.width as u32;
         let requested_h = client_size.height as u32;
 
@@ -532,71 +535,95 @@ impl HyprDisplay {
             );
         }
 
-        let mut inner = self.inner.lock().await;
-        let source_size = inner
-            .output_layout
-            .snapshot()
-            .map(|snapshot| (snapshot.output_w, snapshot.output_h));
-        if let Some(decision) = initial_size_resize_decision(
-            inner.output.is_some(),
-            inner.resolution_fixed,
-            inner.resolution,
-            (cw, ch),
-            source_size,
-        ) {
-            match decision.target {
-                ResizeTarget::ManagedHeadlessOutput => {
-                    tracing::info!(
-                        client_w = requested_w,
-                        client_h = requested_h,
-                        applied_w = decision.width,
-                        applied_h = decision.height,
-                        server_w = inner.width,
-                        server_h = inner.height,
-                        "Client requested initial size; resizing headless output"
-                    );
-
-                    if let Some(desktop_size) = apply_resize_decision_with(
-                        &mut inner,
-                        decision,
-                        &mut resize_headless,
-                        &mut refresh_layout,
-                    ) {
-                        inner.pending_initial_resize = Some(desktop_size);
+        // Phase 1: decide under the lock, then release it before any blocking
+        // Hyprland IPC. The resize blocks (keyword_monitor + a std::thread::sleep
+        // poll up to 5s); running it under the lock pinned a runtime worker for
+        // that whole window and, because HyprDisplayHandle::shutdown() takes this
+        // inner lock directly (bypassing IronRDP's outer display mutex), stalled
+        // shutdown too. (Concurrent size()/updates()/request_layout() are
+        // serialized by that outer mutex regardless and are not the concern.)
+        let (decision, output_name, headless_scale) = {
+            let inner = self.inner.lock().await;
+            let source_size = inner
+                .output_layout
+                .snapshot()
+                .map(|snapshot| (snapshot.output_w, snapshot.output_h));
+            match initial_size_resize_decision(
+                inner.output.is_some(),
+                inner.resolution_fixed,
+                inner.resolution,
+                (cw, ch),
+                source_size,
+            ) {
+                Some(decision) => {
+                    match decision.target {
+                        ResizeTarget::ManagedHeadlessOutput => tracing::info!(
+                            client_w = requested_w,
+                            client_h = requested_h,
+                            applied_w = decision.width,
+                            applied_h = decision.height,
+                            server_w = inner.width,
+                            server_h = inner.height,
+                            "Client requested initial size; resizing headless output"
+                        ),
+                        ResizeTarget::PhysicalPresentation => tracing::info!(
+                            client_w = requested_w,
+                            client_h = requested_h,
+                            applied_w = decision.width,
+                            applied_h = decision.height,
+                            server_w = inner.width,
+                            server_h = inner.height,
+                            "Client requested initial size; updating physical-output presentation"
+                        ),
                     }
+                    (decision, inner.output_name.clone(), inner.headless_scale)
                 }
-                ResizeTarget::PhysicalPresentation => {
-                    tracing::info!(
-                        client_w = requested_w,
-                        client_h = requested_h,
-                        applied_w = decision.width,
-                        applied_h = decision.height,
-                        server_w = inner.width,
-                        server_h = inner.height,
-                        "Client requested initial size; updating physical-output presentation"
-                    );
-                    if let Some(desktop_size) = apply_resize_decision_with(
-                        &mut inner,
-                        decision,
-                        &mut resize_headless,
-                        &mut refresh_layout,
-                    ) {
-                        inner.pending_initial_resize = Some(desktop_size);
+                None => {
+                    if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
+                        let (source_w, source_h) = source_size.unwrap_or_default();
+                        tracing::info!(
+                            client_w = requested_w,
+                            client_h = requested_h,
+                            applied_w = inner.width,
+                            applied_h = inner.height,
+                            source_w,
+                            source_h,
+                            resolution_fixed = inner.resolution_fixed,
+                            "Client requested initial size; keeping the current presentation"
+                        );
                     }
+                    return DesktopSize {
+                        width: inner.width,
+                        height: inner.height,
+                    };
                 }
             }
-        } else if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
-            let (source_w, source_h) = source_size.unwrap_or_default();
-            tracing::info!(
-                client_w = requested_w,
-                client_h = requested_h,
-                applied_w = inner.width,
-                applied_h = inner.height,
-                source_w,
-                source_h,
-                resolution_fixed = inner.resolution_fixed,
-                "Client requested initial size; keeping the current presentation"
-            );
+        };
+
+        // Phase 2: run the (blocking) headless resize with the lock released.
+        // Physical-output presentation never resizes the headless output.
+        if decision.target == ResizeTarget::ManagedHeadlessOutput {
+            if let Err(e) =
+                resize_headless(output_name, decision.width, decision.height, headless_scale).await
+            {
+                tracing::warn!("Failed to resize headless output: {}", e);
+                let inner = self.inner.lock().await;
+                return DesktopSize {
+                    width: inner.width,
+                    height: inner.height,
+                };
+            }
+        }
+
+        // Phase 3: re-acquire the lock and commit the presentation state.
+        let mut inner = self.inner.lock().await;
+        if let Some(desktop_size) = apply_presentation_state_with(
+            &mut inner,
+            decision.width,
+            decision.height,
+            refresh_layout,
+        ) {
+            inner.pending_initial_resize = Some(desktop_size);
         }
 
         DesktopSize {
@@ -732,7 +759,15 @@ impl RdpServerDisplay for HyprDisplay {
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         self.request_initial_size_with(
             client_size,
-            resize_headless_output,
+            // spawn_blocking is load-bearing: resize_headless_output sleeps up to
+            // 5s, so it must run off the runtime worker, not merely off the lock.
+            |output_name, width, height, scale| async move {
+                tokio::task::spawn_blocking(move || {
+                    resize_headless_output(&output_name, width, height, scale)
+                })
+                .await
+                .context("headless resize task panicked")?
+            },
             SharedOutputLayout::update_from_output_with_presentation,
         )
         .await
@@ -1236,7 +1271,7 @@ mod output_downscaling {
                     width: 1920,
                     height: 1200,
                 },
-                |_name, _width, _height, _scale| {
+                |_name, _width, _height, _scale| async move {
                     panic!("physical output must not resize headless output")
                 },
                 refresh_physical_layout_for_test,
@@ -1273,7 +1308,7 @@ mod output_downscaling {
                     width: 1600,
                     height: 900,
                 },
-                |_name, _width, _height, _scale| {
+                |_name, _width, _height, _scale| async move {
                     panic!("physical output must not resize headless output")
                 },
                 |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
@@ -1623,8 +1658,8 @@ mod managed_headless_resize {
                     height: 900,
                 },
                 |name, width, height, scale| {
-                    called = Some((name.to_string(), width, height, scale));
-                    Ok(())
+                    called = Some((name, width, height, scale));
+                    async move { Ok::<(), anyhow::Error>(()) }
                 },
                 refresh_headless_layout_for_test,
             )
@@ -1648,6 +1683,76 @@ mod managed_headless_resize {
                 height: 900
             })
         );
+    }
+
+    #[tokio::test]
+    async fn managed_headless_initial_resize_runs_without_holding_the_display_lock() {
+        // Regression: request_initial_size held self.inner across the blocking
+        // Hyprland resize (up to 5s), which stalled HyprDisplayHandle::shutdown()
+        // — it takes this inner lock directly. The resize must now run with the
+        // lock released. (The production path also wraps it in spawn_blocking to
+        // free the runtime worker; that half is not exercised here.)
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let probe = Arc::clone(&display.inner);
+        let mut lock_was_free = false;
+
+        let size = display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |_name, _width, _height, _scale| {
+                    lock_was_free = probe.try_lock().is_ok();
+                    async move { Ok::<(), anyhow::Error>(()) }
+                },
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert!(
+            lock_was_free,
+            "display lock must be released while the headless resize runs"
+        );
+        assert_eq!(
+            size,
+            DesktopSize {
+                width: 1600,
+                height: 900
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_headless_initial_resize_failure_preserves_state() {
+        // Phase 2 failure path on the initial-size route: a failing headless
+        // resize must keep the current presentation and never commit Phase 3
+        // (no layout refresh, no pending_initial_resize).
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+
+        let size = display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |_name, _width, _height, _scale| async move { anyhow::bail!("resize failed") },
+                |_layout, _output_name, _presentation| {
+                    panic!("layout refresh must not run after a failed headless resize")
+                },
+            )
+            .await;
+
+        assert_eq!(
+            size,
+            DesktopSize {
+                width: 1920,
+                height: 1080
+            }
+        );
+        let inner = display.inner.lock().await;
+        assert_eq!(inner.resolution, (1920, 1080));
+        assert_eq!(inner.pending_initial_resize, None);
     }
 
     #[test]
