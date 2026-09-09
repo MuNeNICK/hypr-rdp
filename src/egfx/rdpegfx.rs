@@ -128,6 +128,88 @@ impl EgfxFrameSession {
 }
 
 impl EgfxShared {
+    /// Encode sparse BGRA damage and enqueue one ClearCodec logical frame.
+    /// None means retry without advancing codec state; Err requires session teardown.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_clearcodec_damage(
+        &self,
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        stride: usize,
+        damage: &[(i32, i32, i32, i32)],
+        timestamp_ms: u32,
+        pixel_format: ironrdp_server::PixelFormat,
+    ) -> anyhow::Result<Option<usize>> {
+        use super::clearcodec::ClearCodecInput;
+        use ironrdp_egfx::server::MixedTilePayload;
+        let input = ClearCodecInput::new(data, width, height, stride, damage, pixel_format)?;
+        if input.rectangles.is_empty()
+            || sender.is_closed()
+            || !self.is_ready()
+            || self.is_avc_enabled()
+            || self.should_backpressure_frames()
+        {
+            return Ok(None);
+        }
+        let mut state = self
+            .clearcodec
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ClearCodec state poisoned"))?;
+        let mut server = handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("EGFX server poisoned"))?;
+        if !server.is_ready() || server.should_backpressure() || sender.is_closed() {
+            return Ok(None);
+        }
+        let Some(channel_id) = server.channel_id() else {
+            return Ok(None);
+        };
+        let Some(surface) = server.get_surface(surface_id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            surface.width == width && surface.height == height,
+            "ClearCodec surface size mismatch"
+        );
+        let encoded = state.encode(&input)?;
+        let bytes = encoded.iter().map(|rect| rect.data.len()).sum();
+        let tiles = encoded
+            .into_iter()
+            .map(|rect| MixedTilePayload::ClearCodec {
+                destination: rect.destination,
+                bitmap_data: rect.data,
+            })
+            .collect();
+        let Some(frame_id) = server.send_mixed_frame(surface_id, tiles, timestamp_ms) else {
+            anyhow::bail!("ClearCodec frame rejected after encode");
+        };
+        let queued = QueuedRdpegfxFrame {
+            frame_id,
+            channel_id,
+            dvc_messages: server.drain_output(),
+        };
+        if !Self::send_rdpegfx_dvc_messages(sender, queued, "ClearCodec", "clearcodec") {
+            anyhow::bail!("ClearCodec transport closed after encode");
+        }
+        // Keep the server lock until local accounting exists, so an ACK callback
+        // cannot overtake the enqueue and be lost from the local window.
+        state.commit();
+        self.record_frame_queued(frame_id);
+        tracing::debug!(
+            frame_id,
+            surface_id,
+            codec = "clearcodec",
+            rectangles = input.rectangles.len(),
+            bytes,
+            "ClearCodec frame queued"
+        );
+        Ok(Some(bytes))
+    }
+
     /// Prepare EGFX state for a resize (Deactivation-Reactivation).
     /// Deletes all old surfaces, sends ResetGraphics at the new dimensions,
     /// and bumps generation so the capture thread re-creates encoder/surface.

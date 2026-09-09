@@ -841,6 +841,19 @@ mod tests {
     }
 
     #[test]
+    fn dmabuf_non_avc_clearcodec_session_selects_shm_without_waiting() {
+        let session = crate::egfx::test_support::negotiated_no_avc_session(16, 16);
+        let mut transport = crate::egfx::EgfxFrameSession::new();
+        let refresh = transport.refresh(&session.shared);
+        assert!(!refresh.ready);
+        assert!(dmabuf_egfx_activation_timed_out(
+            &session.shared,
+            refresh.ready,
+            Instant::now()
+        ));
+    }
+
+    #[test]
     fn dmabuf_encode_failure_tracker_retries_until_fallback_threshold() {
         let mut tracker = DmaBufEncodeFailureTracker::new(3);
 

@@ -217,6 +217,109 @@ impl GfxPduTrace {
     }
 }
 
+/// Wire/decode oracle only: this does not prove a real client presents a frame.
+pub(crate) struct ClearCodecFrameOracle {
+    decoder: ironrdp_graphics::clearcodec::ClearCodecDecoder,
+    sequence: u8,
+}
+
+impl ClearCodecFrameOracle {
+    pub(crate) fn new() -> Self {
+        Self {
+            decoder: ironrdp_graphics::clearcodec::ClearCodecDecoder::new(),
+            sequence: 0,
+        }
+    }
+
+    /// Require one logical frame, exact destination union and source RGB pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assert_frame(
+        &mut self,
+        trace: &GfxPduTrace,
+        surface_id: u16,
+        source: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        damage: &[(i32, i32, i32, i32)],
+    ) -> u32 {
+        let mut active = None;
+        let mut ended = None;
+        let mut hits = vec![0u8; width * height];
+        for pdu in &trace.pdus {
+            match pdu {
+                GfxPdu::StartFrame(start) => {
+                    assert!(active.is_none() && ended.is_none(), "one StartFrame");
+                    active = Some(start.frame_id);
+                }
+                GfxPdu::WireToSurface1(wire) => {
+                    assert!(active.is_some() && ended.is_none(), "payload inside frame");
+                    assert_eq!(wire.codec_id, Codec1Type::ClearCodec);
+                    assert_eq!(wire.surface_id, surface_id);
+                    assert_eq!(wire.pixel_format, ironrdp_egfx::pdu::PixelFormat::XRgb);
+                    assert_eq!(wire.bitmap_data[1], self.sequence, "session-wide sequence");
+                    self.sequence = self.sequence.wrapping_add(1);
+                    let r = &wire.destination_rectangle;
+                    assert!(r.left < r.right && usize::from(r.right) <= width);
+                    assert!(r.top < r.bottom && usize::from(r.bottom) <= height);
+                    let decoded = self
+                        .decoder
+                        .decode(&wire.bitmap_data, r.right - r.left, r.bottom - r.top)
+                        .expect("ClearCodec payload decodes");
+                    assert_eq!(
+                        decoded.len(),
+                        usize::from(r.right - r.left) * usize::from(r.bottom - r.top) * 4
+                    );
+                    for y in r.top..r.bottom {
+                        for x in r.left..r.right {
+                            let offset = (usize::from(y - r.top) * usize::from(r.right - r.left)
+                                + usize::from(x - r.left))
+                                * 4;
+                            let src = usize::from(y) * stride + usize::from(x) * 4;
+                            assert_eq!(
+                                &decoded[offset..offset + 3],
+                                &source[src..src + 3],
+                                "pixel {x},{y}"
+                            );
+                            hits[usize::from(y) * width + usize::from(x)] += 1;
+                        }
+                    }
+                }
+                GfxPdu::EndFrame(end) => {
+                    assert_eq!(active.take(), Some(end.frame_id));
+                    assert!(ended.replace(end.frame_id).is_none());
+                }
+                GfxPdu::ResetGraphics(_)
+                | GfxPdu::CreateSurface(_)
+                | GfxPdu::MapSurfaceToOutput(_)
+                | GfxPdu::DeleteSurface(_) => {
+                    assert!(active.is_none(), "surface setup outside frame");
+                }
+                other => panic!("unexpected ClearCodec output: {other:?}"),
+            }
+        }
+        assert!(active.is_none());
+        for y in 0..height {
+            for x in 0..width {
+                let expected = damage.iter().any(|&(l, t, w, h)| {
+                    w > 0
+                        && h > 0
+                        && (x as i64) >= i64::from(l)
+                        && (x as i64) < i64::from(l) + i64::from(w)
+                        && (y as i64) >= i64::from(t)
+                        && (y as i64) < i64::from(t) + i64::from(h)
+                });
+                assert_eq!(
+                    hits[y * width + x],
+                    u8::from(expected),
+                    "exact damage union at {x},{y}"
+                );
+            }
+        }
+        ended.expect("one complete frame")
+    }
+}
+
 #[derive(Debug)]
 struct DecodedYuv420Frame {
     width: usize,
@@ -915,24 +1018,17 @@ pub(crate) fn negotiated_no_avc_egfx(
     width: u16,
     height: u16,
 ) -> (Arc<EgfxShared>, mpsc::UnboundedReceiver<ServerEvent>) {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(width, height);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
-    let (mut bridge, _handle) =
-        ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-            .expect("EGFX server builds");
-    start_gfx_channel(&mut bridge);
-    process_no_avc_capabilities(&mut bridge);
+    let session = negotiated_no_avc_session(width, height);
+    (session.shared, session.event_rx)
+}
 
-    assert!(shared.is_ready());
-    assert!(!shared.is_avc_enabled());
-
-    (shared, event_rx)
+pub(crate) fn negotiated_no_avc_session(width: u16, height: u16) -> TestGfxSession {
+    let mut session = unnegotiated_egfx_session(width, height, EgfxCodecPolicy::Auto);
+    start_gfx_channel(&mut session.bridge);
+    process_no_avc_capabilities(&mut session.bridge);
+    assert!(session.shared.is_ready());
+    assert!(!session.shared.is_avc_enabled());
+    session
 }
 
 pub(crate) fn tracked_avc444_session(

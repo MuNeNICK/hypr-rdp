@@ -221,7 +221,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
             tracing::warn!(
                 ?cap,
                 policy = ?self.shared.codec_policy(),
-                "EGFX: negotiated capability has no AVC support; using bitmap fallback"
+                "EGFX: negotiated capability has no AVC support; using ClearCodec"
             );
         }
         self.shared.clear_frame_queue();

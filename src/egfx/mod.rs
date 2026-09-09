@@ -1,6 +1,7 @@
 mod avc420;
 mod avc444;
 mod backend;
+mod clearcodec;
 mod factory;
 mod frame;
 mod h264;
