@@ -15,7 +15,10 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::files::{clear_selection, FileSelection, FileWorker, FrozenFiles};
+use super::files::{
+    clear_selection, file_stream_enabled, set_file_capabilities, FileSelection, FileWorker,
+    FrozenFiles,
+};
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
@@ -212,7 +215,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 );
             }
         }
-        if self.file_transfer_mode.permits_to_client() {
+        if file_stream_enabled(&self.files) {
             if let Some(files) = self
                 .files
                 .lock()
@@ -231,8 +234,14 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        set_file_capabilities(
+            &self.files,
+            self.file_transfer_mode.permits_to_client()
+                && capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
+            capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
+        );
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -341,7 +350,7 @@ impl HyprCliprdrBackend {
     fn to_client_worker(&self) -> Option<&FileWorker> {
         self.file_worker
             .as_ref()
-            .filter(|_| self.file_transfer_mode.permits_to_client())
+            .filter(|_| file_stream_enabled(&self.files))
     }
 
     fn has_local_selection(&self, kind: SelectionKind) -> bool {
@@ -570,7 +579,7 @@ mod tests {
                 last_requested_format: None,
                 pending_echo_candidate: None,
                 file_transfer_mode: FileTransferMode::ToClient,
-                files: Arc::default(),
+                files: Arc::new(Mutex::new(None.into())),
                 file_worker: None,
             },
             event_rx,
@@ -721,7 +730,10 @@ mod tests {
             1024,
             10,
         );
-        assert!(worker.handle().freeze(vec![root.clone()], 0));
+        assert!(
+            FileSelection::new(Arc::clone(&backend.files), Some(worker.handle()))
+                .freeze(vec![root.clone()])
+        );
 
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
@@ -778,7 +790,10 @@ mod tests {
             1024,
             3,
         );
-        assert!(worker.handle().freeze(vec![root.clone()], 0));
+        assert!(
+            FileSelection::new(Arc::clone(&backend.files), Some(worker.handle()))
+                .freeze(vec![root.clone()])
+        );
         let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(_))) =
             events.blocking_recv()
         else {
@@ -1414,5 +1429,55 @@ mod tests {
             }
             prop_assert_eq!(backend.last_requested_format, None);
         }
+    }
+
+    #[test]
+    fn negotiated_file_policy_preserves_text_and_respects_config_off() {
+        let (mut backend, mut events) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"still text".to_vec());
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        );
+        backend.on_request_format_list();
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats))) =
+            events.blocking_recv()
+        else {
+            panic!("text offer missing");
+        };
+        assert_eq!(formats[0].id, ClipboardFormatId::CF_UNICODETEXT);
+        assert!(events.try_recv().is_err());
+        let full = ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
+        backend.on_process_negotiated_capabilities(full);
+        assert!(file_stream_enabled(&backend.files));
+        backend.file_transfer_mode = FileTransferMode::Off;
+        backend.on_process_negotiated_capabilities(full);
+        assert!(!file_stream_enabled(&backend.files));
+    }
+
+    #[test]
+    fn peer_without_file_streaming_does_not_get_file_offer() {
+        let (mut backend, mut events) = backend_with_events();
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        );
+        let path =
+            std::env::temp_dir().join(format!("hypr-rdp-review-caps-{}", std::process::id()));
+        std::fs::write(&path, b"file").unwrap();
+        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_regular_files(
+            vec![path.clone()],
+        ));
+        backend.on_request_format_list();
+        let event = events.try_recv();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            !matches!(
+                event,
+                Ok(ServerEvent::Clipboard(
+                    ClipboardMessage::SendInitiateFileCopy(_)
+                ))
+            ),
+            "file offer emitted although the peer negotiated text/image only"
+        );
     }
 }

@@ -184,14 +184,17 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 
 Files move over the clipboard channel the session already negotiates — there is nothing
 extra to launch and no port to open. Select files or folders in any Hyprland file manager,
-press Ctrl+C, and paste them into the RDP client's file manager. It is on by default.
+press Ctrl+C, and paste them into the RDP client's file manager. It is on by default
+when the client negotiates file streaming; clients without that capability retain
+text and image clipboard sync. Files larger than 4 GiB minus one byte additionally
+require the client's huge-file capability.
 
 **A cut is always a copy.** Ctrl+X and Ctrl+C behave identically: the files arrive on the
 client and the originals stay exactly where they were. hypr-rdp never deletes a source
 file, so a transfer that half-succeeds can never lose your only copy.
 
-Copying a folder copies its whole tree, empty subdirectories included. Symbolic links are
-followed and arrive as the file they point at. Sockets, FIFOs and device nodes are skipped
+Copying a folder includes its subdirectories, including empty ones, within the limits
+below. Symbolic links are followed and arrive as the file they point at. Sockets, FIFOs and device nodes are skipped
 and logged rather than transferred. A directory tree containing a symlink cycle is
 detected and terminates rather than looping.
 
@@ -202,9 +205,11 @@ and `LPT1` gain a trailing underscore, and names that are not valid UTF-8 are de
 lossily. Two names in the same directory that collide after adjustment are disambiguated —
 `a:b.txt` and `a?b.txt` become `a_b.txt` and `a_b (2).txt` — so neither silently overwrites
 the other. Names are compared case-insensitively, as Windows compares them, so `README.txt`
-alongside `readme.txt` is also disambiguated even though neither name needed adjusting. No
-single awkward name ever fails the rest of the paste. Because the RDP clipboard gives the
-server no way to learn the client's operating system, this adjustment is applied for every
+alongside `readme.txt` is also disambiguated even though neither name needed adjusting.
+Relative paths longer than 259 UTF-16 code units cannot fit the protocol's file descriptor;
+those entries are skipped with a warning (including the subtree of an overlong directory).
+Other valid entries keep their names and contents paired correctly. Because the RDP
+clipboard gives the server no way to learn the client's operating system, this adjustment is applied for every
 client.
 
 Enumeration and reads run on a worker thread, so copying a large tree does not stall
@@ -214,8 +219,11 @@ than the filesystem answers is refused the excess rather than allowed to queue w
 limit.
 
 Paths are only ever taken from a selection the desktop user themselves put on the
-clipboard — never from anything the client sends — and a file swapped out between the copy
-and the paste is detected and refused rather than served under the old name.
+clipboard — never from anything the client sends — and an open handle retains each
+selected file's identity until the selection and its accepted reads are released. A path swapped out between the copy and the paste is refused
+rather than served under the old name. This does not snapshot the file's bytes: edits to
+the same underlying file may be visible during transfer. Files that cannot be opened,
+including when the process reaches its open-file limit, are skipped with a warning.
 
 #### Settings
 
