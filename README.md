@@ -141,6 +141,11 @@ Setting only `-u`/`--username`/`username` or only
 accepted: the missing half is treated as empty, hypr-rdp logs a warning, and
 the client must match that empty value to authenticate.
 
+When credentials are configured, a new client that completes NLA authentication
+replaces the existing connection, including one that is still healthy. This lets
+a replacement negotiate while the previous client is unreachable. Without
+credentials, TLS-only connections retain the existing one-at-a-time queue policy.
+
 ### Session hooks
 
 `on_session_start` and `on_session_end` run a shell command when a client

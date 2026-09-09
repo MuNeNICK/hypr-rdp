@@ -18,7 +18,7 @@ impl RdpServerInputHandler for HyprInputHandler {
 }
 
 /// Input-owned adapter for RDP session metadata and lifecycle events.
-pub(crate) trait RdpInputSessionSink: Send + Sync {
+pub(crate) trait RdpInputSessionSink: Send {
     fn set_keyboard_layout(&self, keyboard_layout: u32);
     fn session_ended(&self);
 }

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Enabled upstream authenticated session replacement for connections with configured NLA credentials; TLS-only connections retain their existing queue policy.
+
 - Added clipboard file transfer from the Hyprland desktop to the RDP client, including directories within the configured entry and protocol path-length limits.
 - Added `file_transfer_mode`, `file_transfer_max_entries`, and `file_transfer_max_chunk_bytes` settings, each also a command-line flag.
 - Added outbound filename adjustment so names illegal on the client's filesystem still arrive, with collisions disambiguated.

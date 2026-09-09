@@ -8,7 +8,7 @@
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) struct SessionHooks {
@@ -30,53 +30,22 @@ const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HOOK_SESSION_START: &str = "session_start";
 const HOOK_SESSION_END: &str = "session_end";
 
-/// A handle to the hooks that both connection boundaries can drive.
-///
-/// The connection handler owns the start boundary; an accept loop that runs
-/// `run_connection` itself owns the end one, because IronRDP reports that
-/// boundary only from its own loop.
-#[derive(Clone)]
-pub(super) struct SharedSessionHooks(Arc<Mutex<SessionHooks>>);
-
-impl SharedSessionHooks {
-    pub(super) fn session_started(&self) {
-        self.with(SessionHooks::session_started);
-    }
-
-    pub(super) fn session_ended(&self) {
-        self.with(SessionHooks::session_ended);
-    }
-
-    /// A poisoned lock means an earlier caller panicked while holding it. The
-    /// hook state itself stays consistent, so recovering is preferable to
-    /// dropping the end command that a do/undo pair depends on.
-    fn with(&self, body: impl FnOnce(&mut SessionHooks)) {
-        let mut hooks = match self.0.lock() {
-            Ok(hooks) => hooks,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        body(&mut hooks);
-    }
-}
-
 pub(super) fn session_hooks_from_config(
     on_session_start: Option<String>,
     on_session_end: Option<String>,
     instance: Option<String>,
-) -> Option<SharedSessionHooks> {
+) -> Option<SessionHooks> {
     let on_session_start = on_session_start.filter(|command| !command.trim().is_empty());
     let on_session_end = on_session_end.filter(|command| !command.trim().is_empty());
     if on_session_start.is_none() && on_session_end.is_none() {
         return None;
     }
-    Some(SharedSessionHooks(Arc::new(Mutex::new(
-        SessionHooks::spawn(
-            on_session_start,
-            on_session_end,
-            SESSION_HOOK_DEADLINE,
-            instance,
-        ),
-    ))))
+    Some(SessionHooks::spawn(
+        on_session_start,
+        on_session_end,
+        SESSION_HOOK_DEADLINE,
+        instance,
+    ))
 }
 
 impl SessionHooks {
@@ -328,18 +297,6 @@ pub(super) mod test_support {
         )
     }
 
-    pub(in crate::server) fn shared_test_hooks(
-        log: &Path,
-        connect_command: Option<String>,
-        disconnect: bool,
-    ) -> SharedSessionHooks {
-        SharedSessionHooks(Arc::new(Mutex::new(test_hooks(
-            log,
-            connect_command,
-            disconnect,
-        ))))
-    }
-
     pub(in crate::server) fn echo_to_log(log: &Path, word: &str) -> String {
         format!("echo {word} >> '{}'", log.display())
     }
@@ -560,7 +517,7 @@ mod tests {
     #[test]
     fn config_wiring_passes_the_commands_through_in_order() {
         let log = hook_log_path("wiring");
-        let hooks = session_hooks_from_config(
+        let mut hooks = session_hooks_from_config(
             Some(echo_to_log(&log, "start")),
             Some(echo_to_log(&log, "end")),
             None,
