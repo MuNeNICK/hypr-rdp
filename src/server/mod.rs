@@ -107,7 +107,8 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .context("failed to create TLS acceptor")?;
 
     let credentials = ironrdp_credentials(credentials);
-    let secured_builder = match security_mode_for_credentials(&credentials) {
+    let security_mode = security_mode_for_credentials(&credentials);
+    let secured_builder = match security_mode {
         ServerSecurityMode::Tls => builder.with_tls(acceptor),
         ServerSecurityMode::Hybrid => builder.with_hybrid(acceptor, tls_ctx.pub_key),
     };
@@ -115,6 +116,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let mut server = secured_builder
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_preempt_existing_session(security_mode.allows_authenticated_replacement())
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
             input_session_sink,
             session_hooks,
@@ -207,6 +209,14 @@ fn ironrdp_credentials(credentials: Option<ConfigCredentials>) -> Option<Credent
 enum ServerSecurityMode {
     Tls,
     Hybrid,
+}
+
+impl ServerSecurityMode {
+    fn allows_authenticated_replacement(self) -> bool {
+        // IronRDP authenticates Hybrid candidates through CredSSP before eviction.
+        // TLS alone only proves the handshake, so keep its existing queue policy.
+        matches!(self, Self::Hybrid)
+    }
 }
 
 fn security_mode_for_credentials(credentials: &Option<Credentials>) -> ServerSecurityMode {
@@ -369,10 +379,121 @@ mod tests {
     }
 
     #[test]
+    fn replacement_requires_nla_credentials() {
+        assert!(!security_mode_for_credentials(&None).allows_authenticated_replacement());
+        let credentials = ironrdp_credentials(Some(ConfigCredentials {
+            username: "user".into(),
+            password: "pass".into(),
+        }));
+        assert!(security_mode_for_credentials(&credentials).allows_authenticated_replacement());
+    }
+
+    #[test]
     fn audio_mode_off_disables_sound_factory_wiring() {
         assert!(sound_factory_for_audio_mode(AudioMode::Mirror).is_some());
         assert!(sound_factory_for_audio_mode(AudioMode::Redirect).is_some());
         assert!(sound_factory_for_audio_mode(AudioMode::Off).is_none());
+    }
+
+    // This exercises candidate acceptance and non-eviction, not a completed NLA login.
+    #[tokio::test]
+    async fn replacement_policy_controls_candidate_acceptance() {
+        use tokio::io::AsyncReadExt as _;
+
+        struct Accepted(tokio::sync::mpsc::UnboundedSender<SocketAddr>);
+        impl ConnectionHandler for Accepted {
+            fn on_accept(&mut self, peer: SocketAddr) -> bool {
+                self.0.send(peer).expect("accept observer alive");
+                true
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+        for mode in [ServerSecurityMode::Hybrid, ServerSecurityMode::Tls] {
+            let builder = RdpServer::builder().with_addr(([127, 0, 0, 1], 0));
+            let builder = match mode {
+                ServerSecurityMode::Hybrid => {
+                    builder.with_hybrid(acceptor.clone(), key.public_key_raw().to_vec())
+                }
+                ServerSecurityMode::Tls => builder.with_tls(acceptor.clone()),
+            };
+            let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut server = builder
+                .with_no_input()
+                .with_no_display()
+                .with_preempt_existing_session(mode.allows_authenticated_replacement())
+                .with_connection_handler(Some(Box::new(Accepted(accepted_tx))))
+                .build();
+            if mode == ServerSecurityMode::Hybrid {
+                server.set_credentials(ironrdp_credentials(Some(ConfigCredentials {
+                    username: "test".into(),
+                    password: "test".into(),
+                })));
+            }
+            let events = server.event_sender().clone();
+            tokio::task::LocalSet::new()
+                .run_until(async move {
+                    let task = tokio::task::spawn_local(async move { server.run().await });
+                    let addr = wait_for_local_addr(&events).await;
+                    let mut incumbent = TcpStream::connect(addr).await.unwrap();
+                    let first = tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(first, incumbent.local_addr().unwrap());
+                    let mut candidate = TcpStream::connect(addr).await.unwrap();
+                    candidate.write_all(&[0; 43]).await.unwrap();
+                    let second =
+                        tokio::time::timeout(Duration::from_millis(300), accepted_rx.recv()).await;
+                    if mode == ServerSecurityMode::Hybrid {
+                        assert_eq!(second.unwrap().unwrap(), candidate.local_addr().unwrap());
+                        let mut byte = [0];
+                        let closed =
+                            tokio::time::timeout(Duration::from_secs(2), candidate.read(&mut byte))
+                                .await;
+                        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))));
+                        assert!(
+                            tokio::time::timeout(
+                                Duration::from_millis(100),
+                                incumbent.read(&mut byte)
+                            )
+                            .await
+                            .is_err(),
+                            "malformed candidate must not evict the incumbent"
+                        );
+                    } else {
+                        assert!(
+                            second.is_err(),
+                            "TLS-only connections must retain the queue policy"
+                        );
+                    }
+                    drop(candidate);
+                    drop(incumbent);
+                    events
+                        .send(ServerEvent::Quit("test complete".into()))
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), task)
+                        .await
+                        .expect("shutdown must remain bounded")
+                        .unwrap()
+                        .unwrap();
+                })
+                .await;
+        }
     }
 
     #[tokio::test]

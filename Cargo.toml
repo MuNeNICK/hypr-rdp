@@ -15,16 +15,16 @@ vaapi = ["dep:libva-sys"]
 # VA-API hardware encoding (Intel/AMD)
 libva-sys = { version = "0.1.2", optional = true, features = ["drm"] }
 # RDP server dependencies; pin a known revision for reproducible builds.
-ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
-ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
 
 # H.264 encoding (FFmpeg/libavcodec software encoder)
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format"] }
@@ -52,7 +52,7 @@ libc = "0.2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 # Clipboard image support (DIB/PNG conversion)
-ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
+ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
 
 # Config file
 serde = { version = "1", features = ["derive"] }
