@@ -19,7 +19,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libopenh264-dev libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
+          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -30,6 +30,14 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+      - name: Verify bundled software codec
+        run: |
+          readelf -d target/release/hypr-rdp > codec-linkage.txt
+          if grep -E 'NEEDED.*lib(avcodec|avformat|avutil|swscale|swresample|openh264)' codec-linkage.txt; then
+            echo "Unexpected external codec dependency"
+            exit 1
+          fi
 
       - name: Package
         run: |
