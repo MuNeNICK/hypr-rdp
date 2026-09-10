@@ -8,6 +8,7 @@ url="https://github.com/MuNeNICK/hypr-rdp"
 license=('MIT')
 options=(!debug)
 depends=(
+    'fuse3'
     'libpulse'
     'libva'
     'libxkbcommon'

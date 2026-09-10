@@ -97,6 +97,10 @@ pub(super) fn to_crlf(text: &str) -> String {
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
     Image(Vec<u8>), // PNG bytes
+    Files {
+        uri_list: Vec<u8>,
+        gnome_copied_files: Vec<u8>,
+    },
 }
 
 impl PendingWrite {
@@ -104,6 +108,7 @@ impl PendingWrite {
         match self {
             Self::Text(_) => SelectionKind::Text,
             Self::Image(_) => SelectionKind::Image,
+            Self::Files { .. } => SelectionKind::Files,
         }
     }
 
@@ -111,6 +116,10 @@ impl PendingWrite {
         match self {
             Self::Text(data) if SelectionKind::Text.accepts_wayland_mime(mime) => Some(data),
             Self::Image(data) if SelectionKind::Image.accepts_wayland_mime(mime) => Some(data),
+            Self::Files { uri_list, .. } if mime == FILE_URI_LIST_MIME => Some(uri_list),
+            Self::Files {
+                gnome_copied_files, ..
+            } if mime == GNOME_COPIED_FILES_MIME => Some(gnome_copied_files),
             _ => None,
         }
     }

@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
 
   src = lib.cleanSource ../..;
 
-  cargoHash = "sha256-CnpUVqFJoNuqQC8qBSbZtmzWD220BAmng5hAyowseMo=";
+  cargoHash = "sha256-RyAjGI3cyZu1/YOSreCwuhlFUWUBavoA0Xgt4Spl3Rk=";
 
   nativeBuildInputs = [
     pkg-config
@@ -47,6 +47,7 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm644 LICENSE $out/share/licenses/hypr-rdp/LICENSE
     wrapProgram $out/bin/hypr-rdp \
+      --run 'if test -z "''${FUSERMOUNT_PATH-}" && test -x /run/wrappers/bin/fusermount3; then export FUSERMOUNT_PATH=/run/wrappers/bin/fusermount3; fi' \
       --prefix PATH : ${lib.makeBinPath [ pulseaudio ]}
   '';
 

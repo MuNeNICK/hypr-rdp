@@ -16,22 +16,44 @@ pub(crate) const DEFAULT_FILE_TRANSFER_MAX_ENTRIES: usize = 10_000;
 
 /// Which directions of clipboard file transfer a session may serve.
 ///
-/// Only the outbound direction exists so far, so this is a two-state choice the
-/// inbound direction will widen rather than replace.
+/// Disabling a build feature must never enable a direction the user forbade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileTransferMode {
     Off,
     ToClient,
+    ToServer,
+    Both,
 }
 
 impl FileTransferMode {
     pub(crate) fn permits_to_client(self) -> bool {
-        matches!(self, Self::ToClient)
+        matches!(self, Self::ToClient | Self::Both)
+    }
+
+    pub(crate) fn permits_to_server(self) -> bool {
+        cfg!(feature = "client-to-server") && matches!(self, Self::ToServer | Self::Both)
+    }
+
+    fn for_build(self) -> Self {
+        if cfg!(feature = "client-to-server") {
+            self
+        } else {
+            match self {
+                Self::ToServer => Self::Off,
+                Self::Both => Self::ToClient,
+                mode => mode,
+            }
+        }
     }
 }
 
 fn default_file_transfer_mode_name() -> String {
-    "to-client".into()
+    if cfg!(feature = "client-to-server") {
+        "both"
+    } else {
+        "to-client"
+    }
+    .into()
 }
 
 /// The command line beats the config file, as it does for every other option.
@@ -137,7 +159,7 @@ struct Args {
     #[arg(long)]
     on_session_end: Option<String>,
 
-    /// File transfer policy: "off" or "to-client"
+    /// File transfer policy: "off", "to-client", "to-server", or "both"
     #[arg(long)]
     file_transfer_mode: Option<String>,
 
@@ -318,8 +340,13 @@ impl RuntimeConfig {
             config.password_file,
         )?;
         let credentials = ConfigCredentials::from_parts(username, password);
-        let file_transfer_mode =
+        let requested_file_transfer_mode =
             resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
+        let file_transfer_mode = requested_file_transfer_mode.for_build();
+        if file_transfer_mode != requested_file_transfer_mode {
+            tracing::warn!(?requested_file_transfer_mode, ?file_transfer_mode,
+                "Client-to-server file transfer is not compiled in; disabling the unavailable direction");
+        }
 
         for warning in startup_warnings(credentials.as_ref(), bind) {
             match warning {
@@ -438,8 +465,10 @@ fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
     match value {
         "off" => Ok(FileTransferMode::Off),
         "to-client" => Ok(FileTransferMode::ToClient),
+        "to-server" => Ok(FileTransferMode::ToServer),
+        "both" => Ok(FileTransferMode::Both),
         other => {
-            anyhow::bail!("unknown file transfer mode '{other}', expected 'off' or 'to-client'")
+            anyhow::bail!("unknown file transfer mode '{other}', expected 'off', 'to-client', 'to-server', or 'both'")
         }
     }
 }
@@ -754,8 +783,31 @@ mod tests {
     fn file_transfer_is_on_for_the_client_by_default() {
         assert_eq!(
             resolve_file_transfer_mode(None, None).unwrap(),
-            FileTransferMode::ToClient
+            if cfg!(feature = "client-to-server") {
+                FileTransferMode::Both
+            } else {
+                FileTransferMode::ToClient
+            }
         );
+    }
+
+    #[test]
+    fn unavailable_inbound_never_enables_forbidden_outbound_transfer() {
+        for (name, mode, outbound) in [
+            ("off", FileTransferMode::Off, false),
+            ("to-client", FileTransferMode::ToClient, true),
+            ("to-server", FileTransferMode::ToServer, false),
+            ("both", FileTransferMode::Both, true),
+        ] {
+            assert_eq!(parse_file_transfer_mode(name).unwrap(), mode);
+            let effective = mode.for_build();
+            assert_eq!(effective.permits_to_client(), outbound);
+            assert_eq!(
+                effective.permits_to_server(),
+                cfg!(feature = "client-to-server")
+                    && matches!(mode, FileTransferMode::ToServer | FileTransferMode::Both)
+            );
+        }
     }
 
     #[test]

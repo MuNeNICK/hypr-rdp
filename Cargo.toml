@@ -6,10 +6,12 @@ description = "Native RDP server for Hyprland"
 license = "MIT"
 
 [features]
-# Standard builds include VA-API. Use `--no-default-features` for a
-# software-only build.
-default = ["vaapi"]
+# Standard builds include VA-API and inbound file clipboard support.
+# Use --no-default-features --features client-to-server for software encoding
+# with inbound file transfer, or --no-default-features to omit both.
+default = ["vaapi", "client-to-server"]
 vaapi = ["dep:libva-sys"]
+client-to-server = ["dep:fuser"]
 
 [dependencies]
 # VA-API hardware encoding (Intel/AMD)
@@ -68,6 +70,7 @@ xkbcommon = "0.9.0"
 serde_json = "1"
 rustls = { version = "0.23", default-features = false }
 url = "2"
+fuser = { version = "0.18", default-features = false, optional = true }
 
 [dev-dependencies]
 png = "0.18.1"
