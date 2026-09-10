@@ -98,6 +98,9 @@ impl InboundClipboard {
     pub(super) fn enabled(&self) -> bool {
         Self::available() && self.handle.transfer.enabled()
     }
+    pub(super) fn generation(&self) -> Option<u64> {
+        self.handle.transfer.generation()
+    }
     pub(super) fn set_capabilities(&self, stream: bool, huge: bool) {
         self.handle.invalidate();
         self.handle.transfer.capabilities(stream, huge);
@@ -108,14 +111,28 @@ impl InboundClipboard {
     pub(super) fn on_response(&self, response: FileContentsResponse<'_>) {
         self.handle.transfer.on_response(response);
     }
-    pub(super) fn accept(&self, files: &[FileDescriptor], data_id: Option<u32>) {
+    #[cfg(all(test, feature = "client-to-server"))]
+    fn accept(&self, files: &[FileDescriptor], data_id: Option<u32>) {
+        if let Some(generation) = self.generation() {
+            self.accept_for(generation, files, data_id);
+        }
+    }
+
+    pub(super) fn accept_for(
+        &self,
+        generation: u64,
+        files: &[FileDescriptor],
+        data_id: Option<u32>,
+    ) {
         #[cfg(feature = "client-to-server")]
-        if let Some((generation, roots)) = self.handle.transfer.accept(files, data_id) {
+        if let Some((generation, roots)) =
+            self.handle.transfer.accept_for(generation, files, data_id)
+        {
             self.handle
                 .update_service(Some(Job { generation, roots }), false);
         }
         #[cfg(not(feature = "client-to-server"))]
-        let _ = (files, data_id);
+        let _ = (generation, files, data_id);
     }
 }
 
@@ -486,8 +503,16 @@ mod tests {
         responder.abort();
         let _ = responder.await;
         drop(clipboard);
+        let mount_name = mount_path.file_name().unwrap();
+        let mut claim_name = mount_name.to_owned();
+        claim_name.push(".lock");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while mount_path.exists() {
+            // An invalidated FUSE root can return EIO before it is unmounted;
+            // exists() would report false and race cleanup against the mount service.
+            while std::fs::read_dir(&runtime).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name();
+                name == mount_name || name == claim_name
+            }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

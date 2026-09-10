@@ -114,6 +114,11 @@ impl Transfer {
             .is_ok_and(|state| state.stream && !state.closed)
     }
 
+    pub(super) fn generation(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        state.current(state.generation).then_some(state.generation)
+    }
+
     pub(super) fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.invalidate();
@@ -127,12 +132,25 @@ impl Transfer {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn accept(
         &self,
         files: &[FileDescriptor],
         data_id: Option<u32>,
     ) -> Option<(u64, Vec<String>)> {
+        self.accept_for(self.generation()?, files, data_id)
+    }
+
+    pub(super) fn accept_for(
+        &self,
+        expected: u64,
+        files: &[FileDescriptor],
+        data_id: Option<u32>,
+    ) -> Option<(u64, Vec<String>)> {
         let mut state = self.state.lock().ok()?;
+        if !state.current(expected) {
+            return None;
+        }
         state.invalidate();
         if !state.current(state.generation) {
             return None;

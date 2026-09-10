@@ -161,8 +161,13 @@ impl CliprdrServerFactory for HyprCliprdrFactory {}
 /// File-list responses have no request ID. Drain an invalidated exchange before
 /// asking for the latest selection, including when that selection is text.
 enum FileListRequest {
-    Waiting,
-    Draining(Option<ClipboardFormatId>),
+    Waiting(u64),
+    Draining(Option<RemoteSelectionRequest>),
+}
+
+struct RemoteSelectionRequest {
+    format: ClipboardFormatId,
+    file_generation: Option<u64>,
 }
 
 struct HyprCliprdrBackend {
@@ -311,11 +316,17 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 .into_iter()
                 .find_map(|kind| Self::remote_format_for_kind(kind, available_formats))
         });
+        let file_generation = file_format.and_then(|_| self.inbound.as_ref()?.generation());
 
         if self.file_list_request.is_some()
             || (file_format.is_some() && self.last_requested_format.is_some())
         {
-            self.file_list_request = Some(FileListRequest::Draining(format));
+            self.file_list_request = Some(FileListRequest::Draining(format.map(|format| {
+                RemoteSelectionRequest {
+                    format,
+                    file_generation,
+                }
+            })));
             self.pending_echo_candidate = echo_candidate;
             return;
         }
@@ -340,8 +351,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 .is_ok()
             {
                 self.last_requested_format = Some(format);
-                self.file_list_request =
-                    (Some(format) == file_format).then_some(FileListRequest::Waiting);
+                self.file_list_request = file_generation.map(FileListRequest::Waiting);
                 self.pending_echo_candidate = echo_candidate;
             }
         }
@@ -412,11 +422,11 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
         match self.file_list_request.take() {
-            Some(FileListRequest::Waiting) => {
+            Some(FileListRequest::Waiting(generation)) => {
                 self.last_requested_format = None;
                 self.pending_echo_candidate = None;
                 if let Some(inbound) = &self.inbound {
-                    inbound.accept(files, data_id);
+                    inbound.accept_for(generation, files, data_id);
                 }
             }
             Some(request @ FileListRequest::Draining(_)) => self.finish_file_list_request(request),
@@ -432,19 +442,17 @@ impl CliprdrBackend for HyprCliprdrBackend {
 impl HyprCliprdrBackend {
     fn finish_file_list_request(&mut self, request: FileListRequest) {
         self.last_requested_format = None;
-        let FileListRequest::Draining(Some(format)) = request else {
+        let FileListRequest::Draining(Some(RemoteSelectionRequest {
+            format,
+            file_generation,
+        })) = request
+        else {
             self.pending_echo_candidate = None;
             return;
         };
-        let is_file = self.remote_formats.iter().any(|entry| {
-            entry.id == format && entry.name.as_ref() == Some(&ClipboardFormatName::FILE_LIST)
-        });
-        if is_file
-            && !self
-                .inbound
-                .as_ref()
-                .is_some_and(|inbound| inbound.enabled())
-        {
+        if file_generation.is_some_and(|generation| {
+            self.inbound.as_ref().and_then(InboundClipboard::generation) != Some(generation)
+        }) {
             self.pending_echo_candidate = None;
             return;
         }
@@ -456,7 +464,7 @@ impl HyprCliprdrBackend {
                 .is_ok()
             {
                 self.last_requested_format = Some(format);
-                self.file_list_request = is_file.then_some(FileListRequest::Waiting);
+                self.file_list_request = file_generation.map(FileListRequest::Waiting);
                 return;
             }
         }
@@ -760,6 +768,36 @@ mod tests {
         backend.on_format_data_response(FormatDataResponse::new_error());
         backend.on_remote_copy(&[incoming_file_format(0xc003)]);
         assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc003));
+    }
+
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn inbound_file_list_after_local_owner_change_is_ignored() {
+        for deferred in [false, true] {
+            let (mut backend, mut events) = inbound_backend();
+            backend.on_remote_copy(&[incoming_file_format(0xc001)]);
+            take_paste(&mut events);
+            if deferred {
+                backend.on_remote_copy(&[incoming_file_format(0xc002)]);
+            }
+            let handle = backend.inbound.as_ref().unwrap().handle();
+            handle.invalidate(); // The Wayland local-owner callback's production seam.
+            let generation = backend.inbound.as_ref().unwrap().generation();
+            backend.on_remote_file_list(&[FileDescriptor::new("stale").with_file_size(1)], None);
+            assert_eq!(
+                backend.inbound.as_ref().unwrap().generation(),
+                generation,
+                "a stale descriptor response must not install another selection"
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "a deferred stale request must not be sent"
+            );
+            assert!(backend.file_list_request.is_none());
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            backend.on_remote_copy(&[incoming_file_format(0xc003)]);
+            assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc003));
+        }
     }
 
     #[cfg(feature = "client-to-server")]
