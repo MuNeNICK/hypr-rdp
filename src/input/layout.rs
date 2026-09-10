@@ -18,6 +18,23 @@ pub(crate) struct OutputLayoutSnapshot {
     pub(crate) geometry_generation: u32,
 }
 
+/// Input-owned validated layout and geometry, prepared without shared state.
+///
+/// The geometry generation is intentionally absent: it is computed against the
+/// currently committed snapshot at publication time by
+/// [`SharedOutputLayout::apply_prepared`].
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedOutputLayout {
+    output_name: String,
+    output_w: u32,
+    output_h: u32,
+    layout_extent_w: u32,
+    layout_extent_h: u32,
+    output_offset_x: u32,
+    output_offset_y: u32,
+    presentation_geometry: PresentationGeometry,
+}
+
 #[derive(Debug, Default)]
 pub struct SharedOutputLayout {
     inner: Mutex<Option<OutputLayoutSnapshot>>,
@@ -37,7 +54,7 @@ impl SharedOutputLayout {
             output_offset_x,
             output_offset_y,
         ) = query_layout(output_name)?;
-        self.update_snapshot(
+        let prepared = Self::prepare_from_layout_query(
             output_name,
             output_w,
             output_h,
@@ -46,7 +63,9 @@ impl SharedOutputLayout {
             output_offset_x,
             output_offset_y,
             (output_w, output_h),
-        )
+        )?;
+        self.apply_prepared(prepared);
+        Ok(())
     }
 
     pub fn update_from_output_with_presentation(
@@ -54,6 +73,19 @@ impl SharedOutputLayout {
         output_name: &str,
         presentation: (u32, u32),
     ) -> Result<()> {
+        let prepared = Self::prepare_from_output_with_presentation(output_name, presentation)?;
+        self.apply_prepared(prepared);
+        Ok(())
+    }
+
+    /// Query and validate the monitor layout without mutating shared state.
+    ///
+    /// The returned value is input-owned and can be prepared off the async
+    /// worker; publication happens later through [`Self::apply_prepared`].
+    pub(crate) fn prepare_from_output_with_presentation(
+        output_name: &str,
+        presentation: (u32, u32),
+    ) -> Result<PreparedOutputLayout> {
         let (
             output_w,
             output_h,
@@ -62,7 +94,7 @@ impl SharedOutputLayout {
             output_offset_x,
             output_offset_y,
         ) = query_layout(output_name)?;
-        self.update_snapshot(
+        Self::prepare_from_layout_query(
             output_name,
             output_w,
             output_h,
@@ -74,46 +106,40 @@ impl SharedOutputLayout {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn update_snapshot(
-        &self,
-        output_name: &str,
-        output_w: u32,
-        output_h: u32,
-        layout_extent_w: u32,
-        layout_extent_h: u32,
-        output_offset_x: u32,
-        output_offset_y: u32,
-        presentation: (u32, u32),
-    ) -> Result<()> {
-        let source = Size::new(output_w, output_h).context("output has invalid source size")?;
-        let presentation = Size::new(presentation.0, presentation.1)
-            .context("output has invalid presentation size")?;
-        let presentation_geometry = PresentationGeometry::new(source, presentation);
-        let geometry_generation = self
-            .inner
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard.as_ref().map(|old| {
-                    if old.presentation_geometry == presentation_geometry {
-                        old.geometry_generation
-                    } else {
-                        old.geometry_generation.saturating_add(1)
-                    }
-                })
-            })
-            .unwrap_or(0);
-        let snapshot = OutputLayoutSnapshot {
-            output_name: output_name.to_string(),
-            output_w,
-            output_h,
-            layout_extent_w,
-            layout_extent_h,
-            output_offset_x,
-            output_offset_y,
-            presentation_geometry,
-            geometry_generation,
+    /// Publish a prepared layout and advance the geometry generation.
+    ///
+    /// The generation is computed against the currently committed snapshot
+    /// under a single lock, so a stale prepared value cannot overwrite a newer
+    /// committed state with a stale generation. Reapplying the same geometry
+    /// keeps the existing generation.
+    pub(crate) fn apply_prepared(&self, prepared: PreparedOutputLayout) {
+        let snapshot = match self.inner.lock() {
+            Ok(mut guard) => {
+                let geometry_generation = guard
+                    .as_ref()
+                    .map(|old| {
+                        if old.presentation_geometry == prepared.presentation_geometry {
+                            old.geometry_generation
+                        } else {
+                            old.geometry_generation.saturating_add(1)
+                        }
+                    })
+                    .unwrap_or(0);
+                let snapshot = OutputLayoutSnapshot {
+                    output_name: prepared.output_name,
+                    output_w: prepared.output_w,
+                    output_h: prepared.output_h,
+                    layout_extent_w: prepared.layout_extent_w,
+                    layout_extent_h: prepared.layout_extent_h,
+                    output_offset_x: prepared.output_offset_x,
+                    output_offset_y: prepared.output_offset_y,
+                    presentation_geometry: prepared.presentation_geometry,
+                    geometry_generation,
+                };
+                *guard = Some(snapshot.clone());
+                snapshot
+            }
+            Err(_) => return,
         };
         tracing::info!(
             output = %snapshot.output_name,
@@ -128,14 +154,61 @@ impl SharedOutputLayout {
             output_offset_y = snapshot.output_offset_y,
             "Updated input layout mapping"
         );
-        if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(snapshot);
-        }
-        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_from_layout_query(
+        output_name: &str,
+        output_w: u32,
+        output_h: u32,
+        layout_extent_w: u32,
+        layout_extent_h: u32,
+        output_offset_x: u32,
+        output_offset_y: u32,
+        presentation: (u32, u32),
+    ) -> Result<PreparedOutputLayout> {
+        let source = Size::new(output_w, output_h).context("output has invalid source size")?;
+        let presentation = Size::new(presentation.0, presentation.1)
+            .context("output has invalid presentation size")?;
+        let presentation_geometry = PresentationGeometry::new(source, presentation);
+        Ok(PreparedOutputLayout {
+            output_name: output_name.to_string(),
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+            presentation_geometry,
+        })
     }
 
     pub(crate) fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
         self.inner.lock().ok()?.clone()
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_snapshot_for_test(
+        output_name: &str,
+        output_w: u32,
+        output_h: u32,
+        layout_extent_w: u32,
+        layout_extent_h: u32,
+        output_offset_x: u32,
+        output_offset_y: u32,
+        presentation: (u32, u32),
+    ) -> Result<PreparedOutputLayout> {
+        Self::prepare_from_layout_query(
+            output_name,
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+            presentation,
+        )
     }
 
     #[cfg(test)]
@@ -151,7 +224,7 @@ impl SharedOutputLayout {
         output_offset_y: u32,
         presentation: (u32, u32),
     ) -> Result<()> {
-        self.update_snapshot(
+        let prepared = Self::prepare_snapshot_for_test(
             output_name,
             output_w,
             output_h,
@@ -160,7 +233,9 @@ impl SharedOutputLayout {
             output_offset_x,
             output_offset_y,
             presentation,
-        )
+        )?;
+        self.apply_prepared(prepared);
+        Ok(())
     }
 }
 
@@ -305,5 +380,154 @@ mod tests {
             .update_snapshot_for_test("DP-1", 2560, 1440, 2560, 1440, 0, 0, (1920, 1080))
             .expect("source resize");
         assert_eq!(layout.snapshot().unwrap().geometry_generation, 2);
+    }
+
+    #[test]
+    fn preparation_does_not_publish_or_advance_generation() {
+        let layout = SharedOutputLayout::new();
+
+        let prepared = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            2160,
+            3840,
+            2160,
+            0,
+            0,
+            (1920, 1080),
+        )
+        .expect("prepared layout");
+        assert!(layout.snapshot().is_none(), "preparation must not publish");
+
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (3840, 2160))
+            .expect("committed snapshot");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 0);
+
+        layout.apply_prepared(prepared);
+        let snapshot = layout.snapshot().expect("published snapshot");
+        assert_eq!(snapshot.geometry_generation, 1);
+        assert_eq!(snapshot.presentation_geometry.presentation().width, 1920);
+        assert_eq!(snapshot.presentation_geometry.presentation().height, 1080);
+    }
+
+    #[test]
+    fn applying_prepared_generation_depends_on_latest_committed_state() {
+        let layout = SharedOutputLayout::new();
+
+        let prepared = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            2160,
+            3840,
+            2160,
+            0,
+            0,
+            (1920, 1080),
+        )
+        .expect("prepared layout");
+
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (3840, 2160))
+            .expect("committed snapshot");
+        layout
+            .update_snapshot_for_test("DP-1", 2560, 1440, 2560, 1440, 0, 0, (2560, 1440))
+            .expect("newer committed snapshot");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 1);
+
+        layout.apply_prepared(prepared);
+        let snapshot = layout.snapshot().expect("published snapshot");
+        assert_eq!(snapshot.geometry_generation, 2);
+        assert_eq!(snapshot.output_w, 3840);
+        assert_eq!(snapshot.output_h, 2160);
+    }
+
+    #[test]
+    fn preparation_validation_failure_leaves_no_changes() {
+        let layout = SharedOutputLayout::new();
+
+        assert!(SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            2160,
+            3840,
+            2160,
+            0,
+            0,
+            (0, 1080),
+        )
+        .is_err());
+        assert!(
+            layout.snapshot().is_none(),
+            "failed preparation must not publish"
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_zero_source_or_presentation_dimensions() {
+        let zero_source = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            0,
+            2160,
+            3840,
+            2160,
+            0,
+            0,
+            (1920, 1080),
+        );
+        let zero_source_height = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            0,
+            3840,
+            2160,
+            0,
+            0,
+            (1920, 1080),
+        );
+        let zero_presentation = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            2160,
+            3840,
+            2160,
+            0,
+            0,
+            (1920, 0),
+        );
+
+        assert!(zero_source.is_err());
+        assert!(zero_source_height.is_err());
+        assert!(zero_presentation.is_err());
+    }
+
+    #[test]
+    fn prepared_value_keeps_validated_source_and_presentation_fields() {
+        let layout = SharedOutputLayout::new();
+
+        let prepared = SharedOutputLayout::prepare_snapshot_for_test(
+            "DP-1",
+            3840,
+            2160,
+            5000,
+            3000,
+            100,
+            200,
+            (1920, 1080),
+        )
+        .expect("prepared layout");
+        layout.apply_prepared(prepared);
+
+        let snapshot = layout.snapshot().expect("published snapshot");
+        assert_eq!(snapshot.output_name, "DP-1");
+        assert_eq!(snapshot.output_w, 3840);
+        assert_eq!(snapshot.output_h, 2160);
+        assert_eq!(snapshot.layout_extent_w, 5000);
+        assert_eq!(snapshot.layout_extent_h, 3000);
+        assert_eq!(snapshot.output_offset_x, 100);
+        assert_eq!(snapshot.output_offset_y, 200);
+        assert_eq!(snapshot.presentation_geometry.presentation().width, 1920);
+        assert_eq!(snapshot.presentation_geometry.presentation().height, 1080);
+        assert_eq!(snapshot.geometry_generation, 0);
     }
 }

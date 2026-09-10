@@ -19,7 +19,7 @@ use ironrdp_server::{
 use tokio::sync::{mpsc, Mutex};
 
 use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
-use crate::input::SharedOutputLayout;
+use crate::input::{PreparedOutputLayout, SharedOutputLayout};
 
 pub(crate) use wayland::HeadlessOutputGuard;
 
@@ -59,6 +59,9 @@ struct HyprDisplayInner {
     capture_handle: Option<std::thread::JoinHandle<()>>,
     headless_guard: Option<HeadlessOutputGuard>,
     pending_initial_resize: Option<DesktopSize>,
+    resize_gate: Arc<Mutex<()>>,
+    closed: bool,
+    output_size_unconfirmed: bool,
 }
 
 impl HyprDisplayInner {
@@ -89,8 +92,19 @@ pub struct HyprDisplayHandle {
 
 impl HyprDisplayHandle {
     pub async fn shutdown(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.shutdown();
+        let gate = {
+            let mut inner = self.inner.lock().await;
+            inner.closed = true;
+            inner.stop_flag.store(true, Ordering::Release);
+            Arc::clone(&inner.resize_gate)
+        };
+        let permit = gate.lock_owned().await;
+        let lease = Arc::clone(&self.inner);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            lease.blocking_lock().shutdown();
+        })
+        .await;
     }
 }
 
@@ -172,6 +186,21 @@ struct ResizeDecision {
     target: ResizeTarget,
     width: u32,
     height: u32,
+}
+
+// Recover externally mutated output after canceled/failed preparation, even
+// when policy would otherwise skip an unchanged presentation.
+fn reconcile_resize_decision(
+    inner: &HyprDisplayInner,
+    decision: Option<ResizeDecision>,
+) -> Option<ResizeDecision> {
+    decision.or_else(|| {
+        (inner.output.is_none() && inner.output_size_unconfirmed).then_some(ResizeDecision {
+            target: ResizeTarget::ManagedHeadlessOutput,
+            width: inner.resolution.0,
+            height: inner.resolution.1,
+        })
+    })
 }
 
 fn startup_presentation_size(
@@ -312,6 +341,7 @@ fn apply_presentation_state_with(
         return None;
     }
 
+    inner.output_size_unconfirmed = false;
     inner.resolution = (width, height);
     inner.width = width as u16;
     inner.height = height as u16;
@@ -336,6 +366,7 @@ fn apply_resize_decision_with(
 ) -> Option<DesktopSize> {
     match decision.target {
         ResizeTarget::ManagedHeadlessOutput => {
+            inner.output_size_unconfirmed = true;
             if let Err(e) = resize_headless(
                 &inner.output_name,
                 decision.width,
@@ -499,6 +530,9 @@ impl HyprDisplay {
             capture_handle: None,
             headless_guard,
             pending_initial_resize: None,
+            resize_gate: Arc::new(Mutex::new(())),
+            closed: false,
+            output_size_unconfirmed: false,
         }));
 
         let dims = (
@@ -511,121 +545,104 @@ impl HyprDisplay {
         Ok((Self { inner }, handle, dims))
     }
 
-    async fn request_initial_size_with<Fut>(
+    async fn request_initial_size_with(
         &mut self,
         client_size: DesktopSize,
-        resize_headless: impl FnOnce(String, u32, u32, f64) -> Fut,
-        refresh_layout: impl FnOnce(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
-    ) -> DesktopSize
-    where
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        let requested_w = client_size.width as u32;
-        let requested_h = client_size.height as u32;
-
-        // H.264 requires even dimensions
-        let (cw, ch) = clamp_to_h264_software_limits(requested_w, requested_h);
-        if cw != (requested_w & !1) || ch != (requested_h & !1) {
-            tracing::warn!(
-                requested_w,
-                requested_h,
-                applied_w = cw,
-                applied_h = ch,
-                "Client requested size exceeds H.264 software encoder policy limit; clamping"
-            );
-        }
-
-        // Phase 1: decide under the lock, then release it before any blocking
-        // Hyprland IPC. The resize blocks (keyword_monitor + a std::thread::sleep
-        // poll up to 5s); running it under the lock pinned a runtime worker for
-        // that whole window and, because HyprDisplayHandle::shutdown() takes this
-        // inner lock directly (bypassing IronRDP's outer display mutex), stalled
-        // shutdown too. (Concurrent size()/updates()/request_layout() are
-        // serialized by that outer mutex regardless and are not the concern.)
-        let (decision, output_name, headless_scale) = {
-            let inner = self.inner.lock().await;
-            let source_size = inner
+        resize_headless: impl FnOnce(String, u32, u32, f64) -> Result<()> + Send + 'static,
+        prepare_layout: impl FnOnce(&str, (u32, u32)) -> Result<PreparedOutputLayout> + Send + 'static,
+    ) -> DesktopSize {
+        // Acquire before even a no-op decision: canceled work may have changed
+        // the compositor without publishing a new presentation.
+        let gate = Arc::clone(&self.inner.lock().await.resize_gate);
+        let permit = gate.lock_owned().await;
+        let work = {
+            let mut inner = self.inner.lock().await;
+            let source = inner
                 .output_layout
                 .snapshot()
-                .map(|snapshot| (snapshot.output_w, snapshot.output_h));
-            match initial_size_resize_decision(
+                .map(|s| (s.output_w, s.output_h));
+            let requested =
+                clamp_to_h264_software_limits(client_size.width.into(), client_size.height.into());
+            if requested
+                != (
+                    u32::from(client_size.width) & !1,
+                    u32::from(client_size.height) & !1,
+                )
+            {
+                tracing::warn!(
+                    requested_w = client_size.width,
+                    requested_h = client_size.height,
+                    applied_w = requested.0,
+                    applied_h = requested.1,
+                    "Client requested size exceeds H.264 software encoder policy limit; clamping"
+                );
+            }
+            let decision = initial_size_resize_decision(
                 inner.output.is_some(),
                 inner.resolution_fixed,
                 inner.resolution,
-                (cw, ch),
-                source_size,
-            ) {
-                Some(decision) => {
-                    match decision.target {
-                        ResizeTarget::ManagedHeadlessOutput => tracing::info!(
-                            client_w = requested_w,
-                            client_h = requested_h,
-                            applied_w = decision.width,
-                            applied_h = decision.height,
-                            server_w = inner.width,
-                            server_h = inner.height,
-                            "Client requested initial size; resizing headless output"
-                        ),
-                        ResizeTarget::PhysicalPresentation => tracing::info!(
-                            client_w = requested_w,
-                            client_h = requested_h,
-                            applied_w = decision.width,
-                            applied_h = decision.height,
-                            server_w = inner.width,
-                            server_h = inner.height,
-                            "Client requested initial size; updating physical-output presentation"
-                        ),
-                    }
-                    (decision, inner.output_name.clone(), inner.headless_scale)
-                }
-                None => {
-                    if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
-                        let (source_w, source_h) = source_size.unwrap_or_default();
-                        tracing::info!(
-                            client_w = requested_w,
-                            client_h = requested_h,
-                            applied_w = inner.width,
-                            applied_h = inner.height,
-                            source_w,
-                            source_h,
-                            resolution_fixed = inner.resolution_fixed,
-                            "Client requested initial size; keeping the current presentation"
-                        );
-                    }
-                    return DesktopSize {
-                        width: inner.width,
-                        height: inner.height,
-                    };
-                }
-            }
-        };
-
-        // Phase 2: run the (blocking) headless resize with the lock released.
-        // Physical-output presentation never resizes the headless output.
-        if decision.target == ResizeTarget::ManagedHeadlessOutput {
-            if let Err(e) =
-                resize_headless(output_name, decision.width, decision.height, headless_scale).await
-            {
-                tracing::warn!("Failed to resize headless output: {}", e);
-                let inner = self.inner.lock().await;
+                requested,
+                source,
+            );
+            let decision = reconcile_resize_decision(&inner, decision);
+            if inner.closed || decision.is_none() {
+                tracing::debug!(
+                    client_w = client_size.width,
+                    client_h = client_size.height,
+                    applied_w = inner.width,
+                    applied_h = inner.height,
+                    resolution_fixed = inner.resolution_fixed,
+                    closed = inner.closed,
+                    "Client requested initial size; keeping the current presentation"
+                );
                 return DesktopSize {
                     width: inner.width,
                     height: inner.height,
                 };
             }
-        }
-
-        // Phase 3: re-acquire the lock and commit the presentation state.
+            let decision = decision.unwrap();
+            tracing::info!(client_w = client_size.width, client_h = client_size.height,
+                applied_w = decision.width, applied_h = decision.height,
+                server_w = inner.width, server_h = inner.height, target = ?decision.target,
+                "Client requested initial size; applying presentation resize");
+            if decision.target == ResizeTarget::ManagedHeadlessOutput {
+                inner.output_size_unconfirmed = true;
+            }
+            (decision, inner.output_name.clone(), inner.headless_scale)
+        };
+        let lease = Arc::clone(&self.inner);
+        let (decision, name, scale) = work;
+        let result = tokio::task::spawn_blocking(move || {
+            // The lease and permit survive cancellation of the awaiting request.
+            if lease.blocking_lock().closed {
+                anyhow::bail!("display is closed");
+            }
+            if decision.target == ResizeTarget::ManagedHeadlessOutput {
+                resize_headless(name.clone(), decision.width, decision.height, scale)?;
+            }
+            let prepared = prepare_layout(&name, (decision.width, decision.height))?;
+            Ok::<_, anyhow::Error>((prepared, permit, lease))
+        })
+        .await;
         let mut inner = self.inner.lock().await;
-        if let Some(desktop_size) = apply_presentation_state_with(
-            &mut inner,
-            decision.width,
-            decision.height,
-            refresh_layout,
-        ) {
-            inner.pending_initial_resize = Some(desktop_size);
+        match result {
+            Ok(Ok((prepared, _permit, _lease))) if !inner.closed => {
+                let layout = Arc::clone(&inner.output_layout);
+                let size = apply_presentation_state_with(
+                    &mut inner,
+                    decision.width,
+                    decision.height,
+                    |_, _, _| {
+                        layout.apply_prepared(prepared);
+                        Ok(())
+                    },
+                );
+                inner.pending_initial_resize = size;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "Initial resize did not commit"),
+            Err(error) => tracing::warn!(%error, "Initial resize worker failed"),
         }
-
         DesktopSize {
             width: inner.width,
             height: inner.height,
@@ -661,18 +678,24 @@ impl HyprDisplay {
             "Client requested DisplayControl layout"
         );
 
+        let gate = Arc::clone(&self.inner.blocking_lock().resize_gate);
+        let _permit = gate.blocking_lock();
         let mut inner = self.inner.blocking_lock();
+        if inner.closed {
+            return;
+        }
         let source_size = inner
             .output_layout
             .snapshot()
             .map(|snapshot| (snapshot.output_w, snapshot.output_h));
-        let Some(decision) = display_control_resize_decision(
+        let decision = display_control_resize_decision(
             &layout,
             inner.output.is_some(),
             inner.resolution_fixed,
             inner.resolution,
             source_size,
-        ) else {
+        );
+        let Some(decision) = reconcile_resize_decision(&inner, decision) else {
             tracing::trace!(
                 resolution_fixed = inner.resolution_fixed,
                 physical_output = inner.output.is_some(),
@@ -759,16 +782,8 @@ impl RdpServerDisplay for HyprDisplay {
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         self.request_initial_size_with(
             client_size,
-            // spawn_blocking is load-bearing: resize_headless_output sleeps up to
-            // 5s, so it must run off the runtime worker, not merely off the lock.
-            |output_name, width, height, scale| async move {
-                tokio::task::spawn_blocking(move || {
-                    resize_headless_output(&output_name, width, height, scale)
-                })
-                .await
-                .context("headless resize task panicked")?
-            },
-            SharedOutputLayout::update_from_output_with_presentation,
+            |name, width, height, scale| resize_headless_output(&name, width, height, scale),
+            SharedOutputLayout::prepare_from_output_with_presentation,
         )
         .await
     }
@@ -782,10 +797,20 @@ impl RdpServerDisplay for HyprDisplay {
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        // A client may skip initial-size negotiation altogether. Capture must
+        // still wait for a canceled previous session's external mutation.
+        let gate = Arc::clone(&self.inner.lock().await.resize_gate);
+        let _permit = gate.lock_owned().await;
         // Extract stop_flag and handle before joining, to avoid holding
         // the Mutex during a blocking join() call.
         let (stop_flag, handle) = {
             let mut inner = self.inner.lock().await;
+            if inner.closed {
+                return Err(ServerError::reason(
+                    "display closed",
+                    "capture restart rejected",
+                ));
+            }
             drop(inner.update_rx.take());
             (Arc::clone(&inner.stop_flag), inner.capture_handle.take())
         };
@@ -795,6 +820,12 @@ impl RdpServerDisplay for HyprDisplay {
         }
 
         let mut inner = self.inner.lock().await;
+        if inner.closed {
+            return Err(ServerError::reason(
+                "display closed",
+                "capture restart rejected",
+            ));
+        }
 
         let (tx, rx) = mpsc::channel(128);
         inner.update_tx = tx.clone();
@@ -1019,6 +1050,9 @@ mod output_downscaling {
             capture_handle: None,
             headless_guard: None,
             pending_initial_resize: None,
+            resize_gate: Arc::new(Mutex::new(())),
+            closed: false,
+            output_size_unconfirmed: false,
         };
 
         (
@@ -1271,10 +1305,14 @@ mod output_downscaling {
                     width: 1920,
                     height: 1200,
                 },
-                |_name, _width, _height, _scale| async move {
+                |_name, _width, _height, _scale| {
                     panic!("physical output must not resize headless output")
                 },
-                refresh_physical_layout_for_test,
+                |name, size| {
+                    SharedOutputLayout::prepare_snapshot_for_test(
+                        name, 3840, 1080, 3840, 1080, 0, 0, size,
+                    )
+                },
             )
             .await;
 
@@ -1308,10 +1346,10 @@ mod output_downscaling {
                     width: 1600,
                     height: 900,
                 },
-                |_name, _width, _height, _scale| async move {
+                |_name, _width, _height, _scale| {
                     panic!("physical output must not resize headless output")
                 },
-                |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
+                |_name, _presentation| anyhow::bail!("layout refresh failed"),
             )
             .await;
 
@@ -1591,6 +1629,9 @@ mod managed_headless_resize {
             capture_handle: None,
             headless_guard: None,
             pending_initial_resize: None,
+            resize_gate: Arc::new(Mutex::new(())),
+            closed: false,
+            output_size_unconfirmed: false,
         }
     }
 
@@ -1617,6 +1658,15 @@ mod managed_headless_resize {
                 inner: Arc::new(Mutex::new(inner)),
             },
             rx,
+        )
+    }
+
+    fn prepare_headless_layout_for_test(
+        name: &str,
+        size: (u32, u32),
+    ) -> Result<PreparedOutputLayout> {
+        SharedOutputLayout::prepare_snapshot_for_test(
+            name, size.0, size.1, size.0, size.1, 0, 0, size,
         )
     }
 
@@ -1649,7 +1699,8 @@ mod managed_headless_resize {
     #[tokio::test]
     async fn managed_headless_initial_size_callback_resizes_headless_and_updates_pending_resize() {
         let (mut display, _rx) = headless_display_for_callback_test_with_scale((1920, 1080), 1.5);
-        let mut called = None;
+        let called = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&called);
 
         let size = display
             .request_initial_size_with(
@@ -1657,15 +1708,18 @@ mod managed_headless_resize {
                     width: 1600,
                     height: 900,
                 },
-                |name, width, height, scale| {
-                    called = Some((name, width, height, scale));
-                    async move { Ok::<(), anyhow::Error>(()) }
+                move |name, width, height, scale| {
+                    *record.lock().unwrap() = Some((name, width, height, scale));
+                    Ok(())
                 },
-                refresh_headless_layout_for_test,
+                prepare_headless_layout_for_test,
             )
             .await;
 
-        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900, 1.5)));
+        assert_eq!(
+            *called.lock().unwrap(),
+            Some(("HEADLESS-1".into(), 1600, 900, 1.5))
+        );
         assert_eq!(
             size,
             DesktopSize {
@@ -1690,11 +1744,10 @@ mod managed_headless_resize {
         // Regression: request_initial_size held self.inner across the blocking
         // Hyprland resize (up to 5s), which stalled HyprDisplayHandle::shutdown()
         // — it takes this inner lock directly. The resize must now run with the
-        // lock released. (The production path also wraps it in spawn_blocking to
-        // free the runtime worker; that half is not exercised here.)
+        // lock released. This injected callback runs on the same spawn_blocking
+        // boundary as the production IPC operation.
         let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
         let probe = Arc::clone(&display.inner);
-        let mut lock_was_free = false;
 
         let size = display
             .request_initial_size_with(
@@ -1702,18 +1755,14 @@ mod managed_headless_resize {
                     width: 1600,
                     height: 900,
                 },
-                |_name, _width, _height, _scale| {
-                    lock_was_free = probe.try_lock().is_ok();
-                    async move { Ok::<(), anyhow::Error>(()) }
+                move |_name, _width, _height, _scale| {
+                    assert!(probe.try_lock().is_ok());
+                    Ok(())
                 },
-                refresh_headless_layout_for_test,
+                prepare_headless_layout_for_test,
             )
             .await;
 
-        assert!(
-            lock_was_free,
-            "display lock must be released while the headless resize runs"
-        );
         assert_eq!(
             size,
             DesktopSize {
@@ -1736,8 +1785,8 @@ mod managed_headless_resize {
                     width: 1600,
                     height: 900,
                 },
-                |_name, _width, _height, _scale| async move { anyhow::bail!("resize failed") },
-                |_layout, _output_name, _presentation| {
+                |_name, _width, _height, _scale| anyhow::bail!("resize failed"),
+                |_output_name, _presentation| {
                     panic!("layout refresh must not run after a failed headless resize")
                 },
             )
@@ -1753,6 +1802,472 @@ mod managed_headless_resize {
         let inner = display.inner.lock().await;
         assert_eq!(inner.resolution, (1920, 1080));
         assert_eq!(inner.pending_initial_resize, None);
+    }
+
+    #[tokio::test]
+    async fn initial_resize_clean_noop_preserves_pending_state_without_ipc() {
+        for (fixed, requested) in [
+            (false, (1920, 1080)),
+            (false, (0, 900)),
+            (true, (1600, 900)),
+        ] {
+            let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+            let original = DesktopSize {
+                width: 1920,
+                height: 1080,
+            };
+            {
+                let mut inner = display.inner.lock().await;
+                inner.resolution_fixed = fixed;
+                inner.pending_initial_resize = Some(original);
+            }
+            let actual = display
+                .request_initial_size_with(
+                    DesktopSize {
+                        width: requested.0,
+                        height: requested.1,
+                    },
+                    |_, _, _, _| panic!("a clean no-op must not resize the output"),
+                    |_, _| panic!("a clean no-op must not query the layout"),
+                )
+                .await;
+            assert_eq!(actual, original);
+            let inner = display.inner.lock().await;
+            assert_eq!(inner.pending_initial_resize, Some(original));
+            assert!(!inner.output_size_unconfirmed);
+            assert_eq!(
+                inner.output_layout.snapshot().unwrap().geometry_generation,
+                0
+            );
+        }
+    }
+
+    // The blocking callback has its own deadline so a scheduler regression
+    // fails assertions instead of hanging the test process indefinitely.
+    fn wait_for_release(rx: std::sync::mpsc::Receiver<()>) {
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("test must release worker");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_resize_ipc_keeps_runtime_and_display_lock_available() {
+        for physical in [false, true] {
+            for block_preparation in [false, true] {
+                if physical && !block_preparation {
+                    continue;
+                }
+                let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+                if physical {
+                    display.inner.lock().await.output = Some("HEADLESS-1".into());
+                }
+                let inner = Arc::clone(&display.inner);
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let barrier = Arc::new(std::sync::Mutex::new(Some((entered_tx, release_rx))));
+                let resize_barrier = Arc::clone(&barrier);
+                let task = tokio::spawn(async move {
+                    display
+                        .request_initial_size_with(
+                            DesktopSize {
+                                width: 1600,
+                                height: 900,
+                            },
+                            move |_, _, _, _| {
+                                assert!(!physical);
+                                if !block_preparation {
+                                    let (tx, rx) = resize_barrier.lock().unwrap().take().unwrap();
+                                    tx.send(()).unwrap();
+                                    wait_for_release(rx);
+                                }
+                                Ok(())
+                            },
+                            move |name, size| {
+                                if block_preparation {
+                                    let (tx, rx) = barrier.lock().unwrap().take().unwrap();
+                                    tx.send(()).unwrap();
+                                    wait_for_release(rx);
+                                }
+                                prepare_headless_layout_for_test(name, size)
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(1), entered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let state = inner.lock().await;
+                    assert_eq!(state.resolution, (1920, 1080));
+                    assert_eq!(state.pending_initial_resize, None);
+                })
+                .await
+                .expect("runtime and display lock must progress during IPC");
+                release_tx.send(()).unwrap();
+                assert_eq!(
+                    task.await.unwrap(),
+                    DesktopSize {
+                        width: 1600,
+                        height: 900
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_resize_cancelled_job_cannot_overtake_next_request() {
+        use std::future::Future;
+        for via_display_control in [false, true] {
+            for target in [(1920, 1080), (1280, 720)] {
+                let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+                let inner = Arc::clone(&display.inner);
+                let shared = Arc::new(EgfxShared::with_codec_policy(
+                    3,
+                    crate::egfx::EgfxCodecPolicy::Auto,
+                ));
+                shared.set_surface_size(1920, 1080);
+                inner.lock().await.egfx_shared = Some(Arc::clone(&shared));
+                let generation = shared.generation();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let external = Arc::new(std::sync::Mutex::new((1920, 1080)));
+                let old_external = Arc::clone(&external);
+                let old = tokio::spawn(async move {
+                    display
+                        .request_initial_size_with(
+                            DesktopSize {
+                                width: 1600,
+                                height: 900,
+                            },
+                            move |_, w, h, _| {
+                                entered_tx.send(()).unwrap();
+                                wait_for_release(release_rx);
+                                *old_external.lock().unwrap() = (w, h);
+                                Ok(())
+                            },
+                            prepare_headless_layout_for_test,
+                        )
+                        .await
+                });
+                entered_rx.await.unwrap();
+                old.abort();
+                assert!(old.await.unwrap_err().is_cancelled());
+                let gate = Arc::clone(&inner.lock().await.resize_gate);
+                assert!(gate.try_lock().is_err(), "detached job must retain permit");
+                assert_eq!(inner.lock().await.pending_initial_resize, None);
+                assert_eq!(shared.generation(), generation);
+                assert_eq!(shared.get_surface_size(), (1920, 1080));
+                let mut replacement = HyprDisplay {
+                    inner: Arc::clone(&inner),
+                };
+                let new_external = Arc::clone(&external);
+                let called = Arc::new(AtomicBool::new(false));
+                let new_called = Arc::clone(&called);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let replacement = tokio::spawn(async move {
+                    if via_display_control {
+                        tokio::task::spawn_blocking(move || {
+                            started_tx.send(()).unwrap();
+                            replacement.request_layout_with(
+                                single_primary(target.0, target.1),
+                                move |_, w, h, _| {
+                                    new_called.store(true, Ordering::Release);
+                                    *new_external.lock().unwrap() = (w, h);
+                                    Ok(())
+                                },
+                                refresh_headless_layout_for_test,
+                            )
+                        })
+                        .await
+                        .unwrap();
+                    } else {
+                        let future = replacement.request_initial_size_with(
+                            DesktopSize {
+                                width: target.0 as u16,
+                                height: target.1 as u16,
+                            },
+                            move |_, w, h, _| {
+                                new_called.store(true, Ordering::Release);
+                                *new_external.lock().unwrap() = (w, h);
+                                Ok(())
+                            },
+                            prepare_headless_layout_for_test,
+                        );
+                        tokio::pin!(future);
+                        std::future::poll_fn(|cx| {
+                            assert!(future.as_mut().poll(cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        started_tx.send(()).unwrap();
+                        future.await;
+                    }
+                });
+                started_rx.await.unwrap();
+                assert!(gate.try_lock().is_err());
+                assert!(!called.load(Ordering::Acquire));
+                release_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), replacement)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(called.load(Ordering::Acquire));
+                assert_eq!(*external.lock().unwrap(), target);
+                let state = inner.lock().await;
+                assert_eq!(state.resolution, target);
+                assert!(!state.output_size_unconfirmed);
+                assert_eq!(state.output_layout.snapshot().unwrap().output_w, target.0);
+                assert_eq!(
+                    shared.get_surface_size(),
+                    (target.0 as u16, target.1 as u16)
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_resize_shutdown_waits_without_locking_out_runtime() {
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let inner = Arc::clone(&display.inner);
+        let handle = HyprDisplayHandle {
+            inner: Arc::clone(&inner),
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            display
+                .request_initial_size_with(
+                    DesktopSize {
+                        width: 1600,
+                        height: 900,
+                    },
+                    move |_, _, _, _| {
+                        entered_tx.send(()).unwrap();
+                        wait_for_release(release_rx);
+                        Ok(())
+                    },
+                    prepare_headless_layout_for_test,
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let shutdown = tokio::spawn(async move { handle.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if inner.lock().await.closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!shutdown.is_finished());
+        assert!(inner.lock().await.stop_flag.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut display = HyprDisplay {
+            inner: Arc::clone(&inner),
+        };
+        display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |_, _, _, _| panic!("closed display must not issue IPC"),
+                |_, _| panic!("closed display must not prepare layout"),
+            )
+            .await;
+        tokio::task::spawn_blocking(move || {
+            display.request_layout_with(
+                single_primary(1600, 900),
+                |_, _, _, _| panic!("closed DisplayControl must not issue IPC"),
+                |_, _, _| panic!("closed DisplayControl must not refresh layout"),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(inner.lock().await.pending_initial_resize, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_resize_cancelled_job_retains_output_owner_until_completion() {
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let owner = Arc::downgrade(&display.inner);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            display
+                .request_initial_size_with(
+                    DesktopSize {
+                        width: 1600,
+                        height: 900,
+                    },
+                    move |_, _, _, _| {
+                        entered_tx.send(()).unwrap();
+                        wait_for_release(release_rx);
+                        Ok(())
+                    },
+                    prepare_headless_layout_for_test,
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            owner.upgrade().is_some(),
+            "detached IPC must retain output cleanup ownership"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed job must release its final display lease");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_updates_waits_for_cancelled_resize_and_rejects_closed_display() {
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let inner = Arc::clone(&display.inner);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            display
+                .request_initial_size_with(
+                    DesktopSize {
+                        width: 1600,
+                        height: 900,
+                    },
+                    move |_, _, _, _| {
+                        entered_tx.send(()).unwrap();
+                        wait_for_release(release_rx);
+                        Ok(())
+                    },
+                    prepare_headless_layout_for_test,
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut next = HyprDisplay {
+            inner: Arc::clone(&inner),
+        };
+        {
+            let mut updates = next.updates();
+            std::future::poll_fn(|cx| {
+                assert!(
+                    updates.as_mut().poll(cx).is_pending(),
+                    "updates must wait before touching Wayland"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(!inner.lock().await.stop_flag.load(Ordering::Acquire));
+            // Drop the waiting callback before opening its gate: no compositor
+            // exists in this deterministic boundary test.
+        }
+        inner.lock().await.closed = true;
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), next.updates())
+            .await
+            .unwrap();
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("display closed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_updates_rechecks_closed_after_capture_join() {
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let inner = Arc::clone(&display.inner);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        inner.lock().await.capture_handle =
+            Some(std::thread::spawn(move || wait_for_release(release_rx)));
+        let mut updates = display.updates();
+        std::future::poll_fn(|cx| {
+            assert!(updates.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(inner.lock().await.capture_handle.is_none());
+        let shutdown = tokio::spawn({
+            let inner = Arc::clone(&inner);
+            async move {
+                HyprDisplayHandle { inner }.shutdown().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !inner.lock().await.closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), updates)
+            .await
+            .unwrap();
+        assert!(result.err().unwrap().to_string().contains("display closed"));
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_resize_preparation_panic_preserves_state() {
+        for panic in [false, true] {
+            let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+            let generation = display
+                .inner
+                .lock()
+                .await
+                .output_layout
+                .snapshot()
+                .unwrap()
+                .geometry_generation;
+            let size = display
+                .request_initial_size_with(
+                    DesktopSize {
+                        width: 1600,
+                        height: 900,
+                    },
+                    |_, _, _, _| Ok(()),
+                    move |_, _| {
+                        if panic {
+                            panic!("injected preparation panic");
+                        }
+                        anyhow::bail!("injected preparation failure")
+                    },
+                )
+                .await;
+            assert_eq!(
+                size,
+                DesktopSize {
+                    width: 1920,
+                    height: 1080
+                }
+            );
+            let state = display.inner.lock().await;
+            assert_eq!(state.pending_initial_resize, None);
+            assert!(state.output_size_unconfirmed);
+            assert_eq!(
+                state.output_layout.snapshot().unwrap().geometry_generation,
+                generation
+            );
+        }
     }
 
     #[test]
