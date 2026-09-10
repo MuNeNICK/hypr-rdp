@@ -292,9 +292,10 @@ impl CliprdrBackend for HyprCliprdrBackend {
         );
         self.remote_formats = available_formats.to_vec();
         clear_selection(&self.files);
-        if let Some(inbound) = &self.inbound {
-            inbound.invalidate();
-        }
+        let remote_generation = self
+            .inbound
+            .as_ref()
+            .and_then(InboundClipboard::begin_remote_copy);
         let echo_candidate = self
             .echo_candidate
             .lock()
@@ -316,7 +317,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 .into_iter()
                 .find_map(|kind| Self::remote_format_for_kind(kind, available_formats))
         });
-        let file_generation = file_format.and_then(|_| self.inbound.as_ref()?.generation());
+        let file_generation = file_format.and(remote_generation);
 
         if self.file_list_request.is_some()
             || (file_format.is_some() && self.last_requested_format.is_some())

@@ -28,7 +28,11 @@ pub(super) struct InboundHandle {
 
 impl InboundHandle {
     pub(super) fn invalidate(&self) {
-        self.transfer.invalidate();
+        let _ = self.invalidate_selection();
+    }
+
+    fn invalidate_selection(&self) -> Option<u64> {
+        let generation = self.transfer.invalidate_generation();
         if let Ok(mut pending) = self.pending.lock() {
             if matches!(*pending, Some(PendingWrite::Files { .. })) {
                 *pending = None;
@@ -36,6 +40,7 @@ impl InboundHandle {
         }
         #[cfg(feature = "client-to-server")]
         self.update_service(None, false);
+        generation
     }
 
     #[cfg(feature = "client-to-server")]
@@ -101,12 +106,12 @@ impl InboundClipboard {
     pub(super) fn generation(&self) -> Option<u64> {
         self.handle.transfer.generation()
     }
+    pub(super) fn begin_remote_copy(&self) -> Option<u64> {
+        self.handle.invalidate_selection()
+    }
     pub(super) fn set_capabilities(&self, stream: bool, huge: bool) {
         self.handle.invalidate();
         self.handle.transfer.capabilities(stream, huge);
-    }
-    pub(super) fn invalidate(&self) {
-        self.handle.invalidate();
     }
     pub(super) fn on_response(&self, response: FileContentsResponse<'_>) {
         self.handle.transfer.on_response(response);
@@ -305,7 +310,7 @@ mod tests {
                 drop(clipboard);
                 None
             } else {
-                clipboard.invalidate();
+                clipboard.handle.invalidate();
                 Some(clipboard)
             };
             release.send(()).unwrap();

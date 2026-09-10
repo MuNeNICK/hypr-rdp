@@ -119,10 +119,15 @@ impl Transfer {
         state.current(state.generation).then_some(state.generation)
     }
 
-    pub(super) fn invalidate(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.invalidate();
-        }
+    #[cfg(test)]
+    fn invalidate(&self) {
+        let _ = self.invalidate_generation();
+    }
+
+    pub(super) fn invalidate_generation(&self) -> Option<u64> {
+        let mut state = self.state.lock().ok()?;
+        state.invalidate();
+        state.current(state.generation).then_some(state.generation)
     }
 
     pub(super) fn close(&self) {
