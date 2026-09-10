@@ -18,9 +18,10 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
-    PendingWrite, SelectionKind, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
-    UTF8_MIME,
+    PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME,
+    MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
 };
+use super::inbound::InboundHandle;
 
 const DATA_CONTROL_VERSION: u32 = 1;
 
@@ -36,6 +37,7 @@ pub(super) struct ClipboardShared {
     pub(super) pending_write: Arc<Mutex<Option<PendingWrite>>>,
     pub(super) echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     pub(super) file_selection: FileSelection,
+    pub(super) inbound: Option<InboundHandle>,
 }
 
 pub(super) fn clipboard_thread(
@@ -120,6 +122,10 @@ pub(super) fn clipboard_thread(
                     tracing::trace!(len = data.len(), "Clipboard: writing image to Wayland");
                     source.offer(IMAGE_PNG_MIME.to_string());
                 }
+                PendingWrite::Files { .. } => {
+                    source.offer(FILE_URI_LIST_MIME.to_string());
+                    source.offer(GNOME_COPIED_FILES_MIME.to_string());
+                }
             }
             state.active_selection = Some(ActiveSelection {
                 kind: pending.kind(),
@@ -162,6 +168,7 @@ struct ClipState {
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     file_selection: FileSelection,
+    inbound: Option<InboundHandle>,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -186,6 +193,7 @@ impl ClipState {
             pending_write: shared.pending_write,
             echo_candidate: shared.echo_candidate,
             file_selection: shared.file_selection,
+            inbound: shared.inbound,
             manager: None,
             seat: None,
             device: None,
@@ -209,6 +217,9 @@ impl ClipState {
 
     fn local_owner_changed(&self) {
         self.file_selection.clear();
+        if let Some(inbound) = &self.inbound {
+            inbound.invalidate();
+        }
     }
 
     /// Take one pending write and arm suppression before replacing its source.
@@ -776,6 +787,7 @@ mod tests {
             pending_write: Arc::new(Mutex::new(None)),
             echo_candidate: Arc::new(Mutex::new(None)),
             file_selection: FileSelection::new(Arc::default(), None),
+            inbound: None,
         })
     }
 
@@ -786,6 +798,10 @@ mod tests {
         for pending in [
             PendingWrite::Text(b"pasted from the client".to_vec()),
             PendingWrite::Image(vec![0u8; 16]),
+            PendingWrite::Files {
+                uri_list: b"file:///tmp/selection/file\r\n".to_vec(),
+                gnome_copied_files: b"copy\nfile:///tmp/selection/file".to_vec(),
+            },
         ] {
             let mut state = clip_state();
             assert!(state.take_pending_write(now).is_none());
@@ -993,6 +1009,38 @@ mod tests {
         let (read_fd, write_fd) = pipe_pair();
         drop(read_fd);
         assert!(!write_source_data(&write_fd, b"clipboard"));
+    }
+
+    #[test]
+    fn inbound_file_mime_payload() {
+        let pending = PendingWrite::Files {
+            uri_list: b"file:///tmp/selection/a%20b\r\nfile:///tmp/selection/folder\r\n".to_vec(),
+            gnome_copied_files: b"copy\nfile:///tmp/selection/a%20b\nfile:///tmp/selection/folder"
+                .to_vec(),
+        };
+        assert_eq!(pending.kind(), SelectionKind::Files);
+        for mime in [FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME] {
+            let data = pending.data_for_mime(mime).unwrap();
+            let (read_fd, write_fd) = pipe_pair();
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                std::fs::File::from(read_fd)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                bytes
+            });
+            assert!(write_source_data(&write_fd, data));
+            drop(write_fd);
+            assert_eq!(reader.join().unwrap(), data);
+        }
+        for mime in [
+            TEXT_MIME,
+            TEXT_PLAIN_MIME,
+            IMAGE_PNG_MIME,
+            "application/octet-stream",
+        ] {
+            assert!(pending.data_for_mime(mime).is_none());
+        }
     }
 
     #[test]

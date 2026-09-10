@@ -7,8 +7,9 @@ use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendF
 #[cfg(test)]
 use ironrdp_cliprdr::pdu::PackedFileList;
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
+    FormatDataResponse, LockDataId,
 };
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::IntoOwned;
@@ -23,6 +24,7 @@ use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
     MAX_CLIPBOARD_SIZE,
 };
+use super::inbound::InboundClipboard;
 use super::wayland::{clipboard_thread, ClipboardShared};
 use crate::config::FileTransferMode;
 
@@ -120,6 +122,20 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
                 self.file_transfer_max_entries,
             )
         });
+        let inbound = self
+            .event_sender
+            .as_ref()
+            .filter(|_| {
+                self.file_transfer_mode.permits_to_server() && InboundClipboard::available()
+            })
+            .map(|sender| {
+                InboundClipboard::new(
+                    sender.clone(),
+                    Arc::clone(&pending_write),
+                    self.file_transfer_max_entries,
+                    self.file_transfer_max_chunk_bytes,
+                )
+            });
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
             remote_formats: Vec::new(),
@@ -134,11 +150,20 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             file_transfer_mode: self.file_transfer_mode,
             files,
             file_worker,
+            inbound,
+            file_list_request: None,
         })
     }
 }
 
 impl CliprdrServerFactory for HyprCliprdrFactory {}
+
+/// File-list responses have no request ID. Drain an invalidated exchange before
+/// asking for the latest selection, including when that selection is text.
+enum FileListRequest {
+    Waiting,
+    Draining(Option<ClipboardFormatId>),
+}
 
 struct HyprCliprdrBackend {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
@@ -154,6 +179,8 @@ struct HyprCliprdrBackend {
     file_transfer_mode: FileTransferMode,
     files: FrozenFiles,
     file_worker: Option<FileWorker>,
+    inbound: Option<InboundClipboard>,
+    file_list_request: Option<FileListRequest>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -170,6 +197,7 @@ impl fmt::Debug for HyprCliprdrBackend {
 impl Drop for HyprCliprdrBackend {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        drop(self.inbound.take());
         if let Some(handle) = self.watcher_thread.take() {
             let _ = handle.join();
         }
@@ -183,7 +211,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
         let mut capabilities = ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES;
-        if self.file_transfer_mode.permits_to_client() {
+        if self.file_transfer_mode.permits_to_client()
+            || self.file_transfer_mode.permits_to_server()
+        {
             capabilities |= ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
                 | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
                 | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
@@ -242,6 +272,12 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 && capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
             capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
         );
+        if let Some(inbound) = &self.inbound {
+            inbound.set_capabilities(
+                capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
+                capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
+            );
+        }
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -251,15 +287,38 @@ impl CliprdrBackend for HyprCliprdrBackend {
         );
         self.remote_formats = available_formats.to_vec();
         clear_selection(&self.files);
+        if let Some(inbound) = &self.inbound {
+            inbound.invalidate();
+        }
         let echo_candidate = self
             .echo_candidate
             .lock()
             .ok()
             .and_then(|mut candidate| candidate.take());
 
-        let format = SelectionKind::REMOTE_PREFERENCE
-            .into_iter()
-            .find_map(|kind| Self::remote_format_for_kind(kind, available_formats));
+        let file_format = self
+            .inbound
+            .as_ref()
+            .filter(|inbound| inbound.enabled())
+            .and_then(|_| {
+                available_formats
+                    .iter()
+                    .find(|format| format.name.as_ref() == Some(&ClipboardFormatName::FILE_LIST))
+                    .map(|format| format.id)
+            });
+        let format = file_format.or_else(|| {
+            SelectionKind::REMOTE_PREFERENCE
+                .into_iter()
+                .find_map(|kind| Self::remote_format_for_kind(kind, available_formats))
+        });
+
+        if self.file_list_request.is_some()
+            || (file_format.is_some() && self.last_requested_format.is_some())
+        {
+            self.file_list_request = Some(FileListRequest::Draining(format));
+            self.pending_echo_candidate = echo_candidate;
+            return;
+        }
 
         let Some(format) = format else {
             self.last_requested_format = None;
@@ -273,12 +332,18 @@ impl CliprdrBackend for HyprCliprdrBackend {
             return;
         }
 
-        self.last_requested_format = Some(format);
-        self.pending_echo_candidate = echo_candidate;
         if let Some(ref sender) = self.event_sender {
-            let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
-                format,
-            )));
+            if sender
+                .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                    format,
+                )))
+                .is_ok()
+            {
+                self.last_requested_format = Some(format);
+                self.file_list_request =
+                    (Some(format) == file_format).then_some(FileListRequest::Waiting);
+                self.pending_echo_candidate = echo_candidate;
+            }
         }
     }
 
@@ -318,6 +383,10 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        if let Some(request) = self.file_list_request.take() {
+            self.finish_file_list_request(request);
+            return;
+        }
         self.handle_format_data_response(response, MAX_CLIPBOARD_SIZE);
     }
 
@@ -335,9 +404,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
         }
     }
 
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {
-        // This server never asks the client for file contents: the direction
-        // that does is not part of this change.
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        if let Some(inbound) = &self.inbound {
+            inbound.on_response(response);
+        }
+    }
+
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
+        match self.file_list_request.take() {
+            Some(FileListRequest::Waiting) => {
+                self.last_requested_format = None;
+                self.pending_echo_candidate = None;
+                if let Some(inbound) = &self.inbound {
+                    inbound.accept(files, data_id);
+                }
+            }
+            Some(request @ FileListRequest::Draining(_)) => self.finish_file_list_request(request),
+            None => {}
+        }
     }
 
     fn on_lock(&mut self, _data_id: LockDataId) {}
@@ -346,6 +430,39 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
+    fn finish_file_list_request(&mut self, request: FileListRequest) {
+        self.last_requested_format = None;
+        let FileListRequest::Draining(Some(format)) = request else {
+            self.pending_echo_candidate = None;
+            return;
+        };
+        let is_file = self.remote_formats.iter().any(|entry| {
+            entry.id == format && entry.name.as_ref() == Some(&ClipboardFormatName::FILE_LIST)
+        });
+        if is_file
+            && !self
+                .inbound
+                .as_ref()
+                .is_some_and(|inbound| inbound.enabled())
+        {
+            self.pending_echo_candidate = None;
+            return;
+        }
+        if let Some(sender) = &self.event_sender {
+            if sender
+                .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                    format,
+                )))
+                .is_ok()
+            {
+                self.last_requested_format = Some(format);
+                self.file_list_request = is_file.then_some(FileListRequest::Waiting);
+                return;
+            }
+        }
+        self.pending_echo_candidate = None;
+    }
+
     /// The file worker, but only while this session may copy files to the client.
     fn to_client_worker(&self) -> Option<&FileWorker> {
         self.file_worker
@@ -527,6 +644,7 @@ impl HyprCliprdrBackend {
                 Arc::clone(&self.files),
                 self.to_client_worker().map(|worker| worker.handle()),
             ),
+            inbound: self.inbound.as_ref().map(InboundClipboard::handle),
         };
 
         match thread::Builder::new()
@@ -581,6 +699,8 @@ mod tests {
                 file_transfer_mode: FileTransferMode::ToClient,
                 files: Arc::new(Mutex::new(None.into())),
                 file_worker: None,
+                inbound: None,
+                file_list_request: None,
             },
             event_rx,
         )
@@ -590,6 +710,182 @@ mod tests {
         let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         bytes.extend_from_slice(&[0, 0]);
         bytes
+    }
+
+    #[cfg(feature = "client-to-server")]
+    fn inbound_backend() -> (HyprCliprdrBackend, mpsc::UnboundedReceiver<ServerEvent>) {
+        let (mut backend, receiver) = backend_with_events();
+        backend.file_transfer_mode = FileTransferMode::Both;
+        backend.inbound = Some(InboundClipboard::new(
+            backend.event_sender.as_ref().unwrap().clone(),
+            Arc::clone(&backend.pending_write),
+            100,
+            1024,
+        ));
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED,
+        );
+        (backend, receiver)
+    }
+
+    #[cfg(feature = "client-to-server")]
+    fn incoming_file_format(id: u32) -> ClipboardFormat {
+        ClipboardFormat::new(ClipboardFormatId::new(id)).with_name(ClipboardFormatName::FILE_LIST)
+    }
+
+    #[cfg(feature = "client-to-server")]
+    fn take_paste(receiver: &mut mpsc::UnboundedReceiver<ServerEvent>) -> ClipboardFormatId {
+        let ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(format)) =
+            receiver.try_recv().expect("one paste request")
+        else {
+            panic!("expected a paste request")
+        };
+        format
+    }
+
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn inbound_file_lists_drain_before_requesting_latest_selection() {
+        let (mut backend, mut events) = inbound_backend();
+        backend.on_remote_copy(&[incoming_file_format(0xc001)]);
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc001));
+        backend.on_remote_copy(&[incoming_file_format(0xc002)]);
+        backend.on_remote_copy(&[incoming_file_format(0xc003)]);
+        assert!(events.try_recv().is_err());
+        backend.on_remote_file_list(&[FileDescriptor::new("old").with_file_size(1)], None);
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc003));
+        assert!(events.try_recv().is_err());
+        // Failed descriptor responses release the slot so the next copy can retry.
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        backend.on_remote_copy(&[incoming_file_format(0xc003)]);
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc003));
+    }
+
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn inbound_waits_for_text_response_and_respects_negotiated_streaming() {
+        let (mut backend, mut events) = inbound_backend();
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::CF_UNICODETEXT);
+        backend.on_remote_copy(&[incoming_file_format(0xc001)]);
+        assert!(events.try_recv().is_err());
+        backend.on_format_data_response(FormatDataResponse::new_unicode_string("old text"));
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc001));
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        backend.on_process_negotiated_capabilities(ClipboardGeneralCapabilityFlags::empty());
+        backend.on_remote_copy(&[
+            incoming_file_format(0xc001),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ]);
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::CF_UNICODETEXT);
+    }
+
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn inbound_public_channel_replay_does_not_publish_superseded_files() {
+        use ironrdp_cliprdr::pdu::{
+            Capabilities, ClipboardPdu, ClipboardProtocolVersion, FormatList, PackedFileList,
+        };
+        use ironrdp_cliprdr::CliprdrServer;
+        use ironrdp_svc::SvcProcessor;
+
+        // Replay production policy without starting a real compositor connection.
+        #[derive(Debug)]
+        struct ReplayBackend(HyprCliprdrBackend);
+        ironrdp_core::impl_as_any!(ReplayBackend);
+        impl CliprdrBackend for ReplayBackend {
+            fn temporary_directory(&self) -> &str {
+                self.0.temporary_directory()
+            }
+            fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+                self.0.client_capabilities()
+            }
+            fn on_ready(&mut self) {}
+            fn on_request_format_list(&mut self) {
+                self.0.on_request_format_list();
+            }
+            fn on_process_negotiated_capabilities(
+                &mut self,
+                flags: ClipboardGeneralCapabilityFlags,
+            ) {
+                self.0.on_process_negotiated_capabilities(flags);
+            }
+            fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+                self.0.on_remote_copy(formats);
+            }
+            fn on_format_data_request(&mut self, request: FormatDataRequest) {
+                self.0.on_format_data_request(request);
+            }
+            fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+                self.0.on_format_data_response(response);
+            }
+            fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
+                self.0.on_remote_file_list(files, data_id);
+            }
+            fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+                self.0.on_file_contents_request(request);
+            }
+            fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+                self.0.on_file_contents_response(response);
+            }
+            fn on_lock(&mut self, data_id: LockDataId) {
+                self.0.on_lock(data_id);
+            }
+            fn on_unlock(&mut self, data_id: LockDataId) {
+                self.0.on_unlock(data_id);
+            }
+        }
+
+        fn process(channel: &mut CliprdrServer, pdu: ClipboardPdu<'_>) {
+            channel
+                .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                .unwrap();
+        }
+        let (backend, mut events) = inbound_backend();
+        let pending = Arc::clone(&backend.pending_write);
+        let flags = backend.client_capabilities();
+        assert!(!flags.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA));
+        let mut channel = CliprdrServer::new(Box::new(ReplayBackend(backend)));
+        channel.start().unwrap();
+        process(
+            &mut channel,
+            ClipboardPdu::Capabilities(Capabilities::new(ClipboardProtocolVersion::V2, flags)),
+        );
+        let files = [incoming_file_format(0xc001)];
+        process(
+            &mut channel,
+            ClipboardPdu::FormatList(FormatList::new_unicode(&files, true).unwrap()),
+        );
+        channel.initiate_paste(take_paste(&mut events)).unwrap();
+        let text = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        process(
+            &mut channel,
+            ClipboardPdu::FormatList(FormatList::new_unicode(&text, true).unwrap()),
+        );
+        assert!(events.try_recv().is_err());
+        process(
+            &mut channel,
+            ClipboardPdu::FormatDataResponse(
+                FormatDataResponse::new_file_list(&PackedFileList {
+                    files: vec![FileDescriptor::new("superseded").with_file_size(1)],
+                })
+                .unwrap(),
+            ),
+        );
+        assert!(pending.lock().unwrap().is_none());
+        assert_eq!(take_paste(&mut events), ClipboardFormatId::CF_UNICODETEXT);
+        channel
+            .initiate_paste(ClipboardFormatId::CF_UNICODETEXT)
+            .unwrap();
+        process(
+            &mut channel,
+            ClipboardPdu::FormatDataResponse(FormatDataResponse::new_unicode_string("latest")),
+        );
+        assert!(
+            matches!(pending.lock().unwrap().as_ref(), Some(PendingWrite::Text(bytes)) if bytes == b"latest")
+        );
     }
 
     fn recv_file_response(
@@ -633,6 +929,8 @@ mod tests {
             file_transfer_mode: FileTransferMode::ToClient,
             files,
             file_worker: Some(worker),
+            inbound: None,
+            file_list_request: None,
         };
 
         backend.on_file_contents_request(FileContentsRequest {
@@ -1291,7 +1589,7 @@ mod tests {
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("pending write") {
             PendingWrite::Text(data) => assert_eq!(data, b"ok"),
-            PendingWrite::Image(_) => panic!("expected text pending write"),
+            _ => panic!("expected text pending write"),
         }
     }
 
@@ -1329,7 +1627,7 @@ mod tests {
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("existing pending write remains") {
             PendingWrite::Text(data) => assert_eq!(data, b"old"),
-            PendingWrite::Image(_) => panic!("expected existing text pending write"),
+            _ => panic!("expected existing text pending write"),
         }
     }
 

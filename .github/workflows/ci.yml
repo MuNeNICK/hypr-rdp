@@ -18,16 +18,19 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
+          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev fuse3
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Format
+        run: cargo fmt --check
+
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test default features
         run: cargo test
@@ -37,6 +40,14 @@ jobs:
 
       - name: Test software-only features
         run: cargo test --no-default-features
+
+      - name: Test software encoding with inbound clipboard
+        run: cargo test --no-default-features --features client-to-server
+
+      - name: Copy bytes through the inbound FUSE filesystem
+        run: |
+          sudo modprobe fuse
+          cargo test --no-default-features --features client-to-server inbound_real_mount_copy_bytes -- --ignored --test-threads=1
 
       - name: Test generated inputs software-only
         run: PROPTEST_CASES=512 cargo test --no-default-features generated_

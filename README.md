@@ -6,7 +6,7 @@ Native RDP server for Hyprland.
 - PipeWire audio forwarding
 - Keyboard and mouse input
 - Bidirectional text and image clipboard sync
-- Clipboard file transfer from the desktop to the client
+- Bidirectional clipboard file transfer
 - TLS certificates and optional session hooks
 
 Requires **Hyprland 0.54+**. AVC420 is the default codec; AVC444 is experimental and currently uses software encoding.
@@ -119,24 +119,35 @@ Run `hypr-rdp --help` for all options.
 
 ### File transfer
 
-Copy files or folders in a Hyprland file manager, then paste into the client's
-file manager. The client must support clipboard file streaming. Transfer from
-the client to the desktop is not supported yet.
+Copy files or folders in either file manager, then paste into the other.
+The RDP client must support clipboard file streaming. Receiving files on the
+Hyprland desktop also requires FUSE access and `fusermount3` (Arch: `fuse3`).
+The Nix package uses `/run/wrappers/bin/fusermount3` when available, otherwise
+the helper on `PATH`. `FUSERMOUNT_PATH` can override that choice.
 
 - Cut acts as copy; source files are never deleted.
-- Names are adjusted for Windows compatibility. Unreadable files and overlong
-  paths are skipped; large selections may be truncated at the entry limit.
+- For desktop-to-client transfers, names are adjusted for Windows compatibility;
+  unreadable files and overlong paths are skipped. Large selections in either
+  direction may be truncated at the entry limit.
 - Keep source files unchanged until the transfer finishes.
+- Wait for a transfer to finish before copying another selection. Clipboard
+  replacement during a transfer has known limitations in IronRDP and may fail
+  the transfer or interrupt the session.
 
 | Config key | Default | Purpose |
 | --- | --- | --- |
-| `file_transfer_mode` | `"to-client"` | Set to `"off"` to disable file contents transfer |
+| `file_transfer_mode` | `"both"` | `"both"`, `"to-client"`, `"to-server"`, or `"off"`; directions are relative to the RDP client |
 | `file_transfer_max_entries` | `10000` | Selection entry budget, including skipped entries; maximum `100000` |
 | `file_transfer_max_chunk_bytes` | `8388608` | Maximum bytes per read request |
 
 These settings also have CLI flags, such as `--file-transfer-mode off`.
 Disabling file transfer leaves text/image sync enabled; copied file paths may
 still appear on the client's clipboard as text.
+
+The `client-to-server` Cargo feature is enabled by default. Builds without it
+default to `"to-client"`; `"both"` narrows to `"to-client"` and `"to-server"`
+narrows to `"off"`. To use software encoding with inbound transfer, build with
+`--no-default-features --features client-to-server`.
 
 ### Session hooks
 
