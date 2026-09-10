@@ -41,6 +41,8 @@ sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 Runtime dependencies: `libva`, `pipewire`, `libxkbcommon`,
 and `pactl` for the default audio routing mode. Hardware encoding also needs
 an appropriate VA-API driver. The software encoder uses bundled OpenH264.
+Receiving clipboard files on the desktop also needs FUSE and `fusermount3`
+(Arch: `fuse3`).
 
 ### Build from source
 
@@ -53,6 +55,10 @@ cd hypr-rdp
 cargo build --release --locked
 sudo install -Dm755 target/release/hypr-rdp /usr/local/bin/hypr-rdp
 ```
+
+Inbound clipboard file transfer requires the `client-to-server` Cargo feature,
+enabled by default. To use software encoding with inbound transfer, build with
+`--no-default-features --features client-to-server`.
 
 ## Quick start
 
@@ -116,38 +122,15 @@ Run `hypr-rdp --help` for all options.
 | `--audio-mode` | `redirect` to RDP, `mirror` local playback, or `off` | `redirect` |
 | `--keyboard-layout-policy` | `client` layout or existing `compositor` keymap | `client` |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
+| `--file-transfer-mode` | `both`, `to-client`, `to-server`, or `off`; directions are relative to the RDP client | `both` |
+| `--file-transfer-max-entries` | Selection entry budget, including skipped entries; maximum `100000` | `10000` |
+| `--file-transfer-max-chunk-bytes` | Maximum bytes per read request | `8388608` |
 
-### File transfer
-
-Copy files or folders in either file manager, then paste into the other.
-The RDP client must support clipboard file streaming. Receiving files on the
-Hyprland desktop also requires FUSE access and `fusermount3` (Arch: `fuse3`).
-The Nix package uses `/run/wrappers/bin/fusermount3` when available, otherwise
-the helper on `PATH`. `FUSERMOUNT_PATH` can override that choice.
-
-- Cut acts as copy; source files are never deleted.
-- For desktop-to-client transfers, names are adjusted for Windows compatibility;
-  unreadable files and overlong paths are skipped. Large selections in either
-  direction may be truncated at the entry limit.
-- Keep source files unchanged until the transfer finishes.
-- Wait for a transfer to finish before copying another selection. Clipboard
-  replacement during a transfer has known limitations in IronRDP and may fail
-  the transfer or interrupt the session.
-
-| Config key | Default | Purpose |
-| --- | --- | --- |
-| `file_transfer_mode` | `"both"` | `"both"`, `"to-client"`, `"to-server"`, or `"off"`; directions are relative to the RDP client |
-| `file_transfer_max_entries` | `10000` | Selection entry budget, including skipped entries; maximum `100000` |
-| `file_transfer_max_chunk_bytes` | `8388608` | Maximum bytes per read request |
-
-These settings also have CLI flags, such as `--file-transfer-mode off`.
-Disabling file transfer leaves text/image sync enabled; copied file paths may
-still appear on the client's clipboard as text.
-
-The `client-to-server` Cargo feature is enabled by default. Builds without it
-default to `"to-client"`; `"both"` narrows to `"to-client"` and `"to-server"`
-narrows to `"off"`. To use software encoding with inbound transfer, build with
-`--no-default-features --features client-to-server`.
+Clipboard file transfer copies files or folders in either file manager and
+pastes them into the other; the RDP client must support clipboard file
+streaming. Cut acts as copy and source files are never deleted, so keep them
+unchanged until the transfer finishes. Wait for a transfer to finish before
+copying another selection.
 
 ### Session hooks
 
